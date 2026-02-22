@@ -2006,3 +2006,15 @@ def run_transformer_pipeline(
         'best_params': best_hp, 'rmse': rmse, 'std_rmse': std_rmse,
         'val_preds': val_df, 'future_preds': future_df, 'tuning_results': tuning_results,
     }
+
+def base_dir(folders = []):
+    things = os.getcwd().split('/')
+    ct2Index = things.index(REPO)
+    if isinstance(folders, str):
+        folders = [folders]
+    final = things[:(ct2Index+1)] + folders
+    final = '/'.join(final)
+
+    if os.path.exists(final):
+        return final
+    raise ValueError(f'{final} nonexistent')

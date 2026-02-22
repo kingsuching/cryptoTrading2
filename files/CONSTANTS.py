@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 COIN = 'BTC'
 RESPONSE = 'close'
@@ -31,6 +32,7 @@ SELL_THRESHOLD = -0.015     # -1.5% expected loss
 STRONG_SELL_THRESHOLD = -0.03  # -3% for strong sell
 HIGH_CONFIDENCE = 0.80      # 80% model agreement
 MIN_CONFIDENCE = 0.50       # 50% minimum for action
+REPO = 'cryptoTrading2'
 
 # =============================================================================
 # USER INPUT: Enter your investment amount here
@@ -65,3 +67,5 @@ MODEL_FILES = {
         'transformer': ('transformer_future_predictions.csv', 'predicted_price'),
         'gbm': ('gbm_future_predictions.csv', 'predicted_price'),
     }
+
+NOTEBOOKS = 'notebooks'
