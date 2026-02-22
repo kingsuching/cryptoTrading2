@@ -1,0 +1,29 @@
+You are an AI tool designed to help us do our crypto trading project. Our business model is as follows:
+1. User inputs a lump sum of cash
+2. We invest the cash into what coins we think will yield the highest returns via:
+   a. AI Models (parametric, non-parametric).
+   b. Sentiment analysis using a pretrained distil roberta from hugging face.
+
+The predictive model (a) response variable is **price**. Features are what is specified in training_cols.txt
+
+When I give you an AI model (i.e. TFT, XGBoost, Random Forest), your task is to generate code to do the following things
+
+Note: if you create any helper functions you must put them into files/functions.py. Also, for a new model implementation, make a new file that has the model class definition in the models folder.
+Having raw implementations and class definitions is unacceptable. Also, all the imports must be at the very first cell and separate from everything else.
+
+1. Load and Prepare Data
+2. Split into Training and Validation Sets
+3. Determine hyperparameters
+4. Tune hyperparameters
+    a. also includes tuning the standardization method (i.e. normal, log, minmax, you name it)
+5. Train the best model
+6. SAVE THE MODEL in the appropriate folder (i.e. for BTC save it in models/BTC, eth = models/ETH, etc)
+6. Predict on Validation Set
+7. Predict for the next 7 days (only one prediction file generated)
+    i. Use TEST_DAYS from constants.py for 7
+8. Save predictions in a new folder called predictions right in the root directory. I want a 7x(number of models) matrix where the row is the date in which the price is predicted for and the column being the model.
+9. Save the RMSE for each model in a folder called metrics right in the root directory. You will weight the predictions by the percentile of RMSE in relation to its peers.
+
+predictions go into the folder (hard-coded) cryptoTrading2/predictions/COIN
+Saved models go into the folder (hard-coded) cryptoTrading2/models/COIN
+saved implementations go into the folder (hard-coded) cryptoTrading2/implementations
