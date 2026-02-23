@@ -16,7 +16,7 @@ EXPLANATORY_VARIABLES = [
     'avg_sentiment',
 ]
 EMPTY_STRING = '-'
-LIMIT = 365
+LIMIT = 730
 TRAINING_COLUMNS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'training_columns.txt')
 TRAIN_PCT = 0.8
 MODEL = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"

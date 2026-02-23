@@ -18,11 +18,12 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from files import CONSTANTS
 from files.API_KEYS import *
 from files.CONSTANTS import *
-from sklearn.neighbors import KNeighborsRegressor  # Added for KNN
-from sklearn.metrics import mean_squared_error  # Added for RMSE
-from sklearn.model_selection import TimeSeriesSplit, ParameterGrid  # Added for time series CV & grid
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
 from pathlib import Path
 from typing import Tuple, Dict
+import pickle
 
 BASE_DIR = os.path.dirname(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -417,7 +418,7 @@ def normalize_sequences(df_column, scaler):
     return normalized_sequences
 
 
-def dataSetup(data, trainingColPath='training_columns.txt', response='close'):
+def dataSetup(data, trainingColPath='training_columns.txt', response='close',  number=None):
     """
     Sets up the data for training
     :param data: full dataset
@@ -459,6 +460,8 @@ def dataSetup(data, trainingColPath='training_columns.txt', response='close'):
     daily_data = daily_data.sort_values('time')
     daily_data.set_index('time', inplace=True)
     daily_data['gradient'] = daily_data['close'].diff().fillna(0.0)  # proper gradient
+    if number:
+        daily_data = daily_data.iloc[-number:, :]
     return daily_data
 
 
@@ -837,33 +840,32 @@ def _standardized_rmse(y_true: pd.Series, y_pred: np.ndarray):
 
 
 def _save_validation_predictions(df: pd.DataFrame, coin: str, model_name: str):
-    os.makedirs(f'predictions/{coin}', exist_ok=True)
-    path = f'predictions/{coin}/{model_name}_predictions.csv'
+    path = os.path.join(base_dir('predictions'), coin)
+    path += f'{model_name}_validation_predictions.csv'
     df.to_csv(path, index=True)
     return path
 
 
 def _save_future_predictions(df: pd.DataFrame, coin: str, model_name: str):
-    os.makedirs(f'predictions/{coin}', exist_ok=True)
-    path = f'predictions/{coin}/{model_name}_future_predictions.csv'
+    path = os.path.join(base_dir('predictions'), coin)
+    path += f'{model_name}_future_predictions.csv'
     df.to_csv(path, index=True)
     return path
 
 
 def _save_standardized_rmse(value: float, coin: str, model_name: str):
-    os.makedirs(f'predictions/{coin}', exist_ok=True)
-    path = f'predictions/{coin}/{model_name}_standardized_rmse.txt'
+    path = os.path.join(base_dir('predictions'), coin)
+    path += f'{model_name}_standardized_rmse.txt'
     with open(path, 'w') as f:
         f.write(f"{value:.6f}\n")
     return path
 
 
 def _save_knn_model(model: KNeighborsRegressor, scaler: StandardScaler, coin: str):
-    import pickle
-    model_dir = f'models/{coin}'
-    os.makedirs(model_dir, exist_ok=True)
-    model_path = f'{model_dir}/{coin}_knn_model.pkl'
-    scaler_path = f'{model_dir}/{coin}_knn_scaler.pkl'
+    model_path = os.path.join(base_dir('models'), coin)
+    model_path += f'{coin}_knn_model.pkl'
+    scaler_path = os.path.join(base_dir('models'), coin)
+    scaler_path += f'{coin}_scaler.pkl'
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
     with open(scaler_path, 'wb') as f:
@@ -1175,16 +1177,17 @@ def run_prophet_pipeline(coin: str = COIN, response: str = RESPONSE, training_co
     wrapper = ProphetWrapper(final_model, target_scaler, feature_scaler, features, best_combo['scaler_method'],
                              best_combo['params'])
     future_df = _prophet_future_forecast(wrapper, daily_data, features, response, n=forecast_days)
+    correct_path = os.path.join(base_dir('predictions'), coin)
     # Save artifacts
-    os.makedirs(f'predictions/{coin}', exist_ok=True)
-    future_path = f'predictions/{coin}/prophet_future_predictions.csv'
+    os.makedirs(f'{correct_path}/{coin}', exist_ok=True)
+    future_path = f'{correct_path}/{coin}/prophet_future_predictions.csv'
     future_df.to_csv(future_path, index=True)
-    std_rmse_path = f'predictions/{coin}/prophet_standardized_rmse.txt'
+    std_rmse_path = f'{correct_path}/{coin}/prophet_standardized_rmse.txt'
     with open(std_rmse_path, 'w') as f:
         f.write(f"{best_combo['standardized_rmse']:.6f}\n")
     model_path = _save_prophet_model(wrapper, coin)
     # Save tuning results
-    tuning_path = f'predictions/{coin}/prophet_tuning_results.csv'
+    tuning_path = f'{correct_path}/{coin}/prophet_tuning_results.csv'
     pd.DataFrame(tuning_results).sort_values('standardized_rmse').to_csv(tuning_path, index=False)
     return {
         'best_params': best_combo['params'],
@@ -1435,19 +1438,17 @@ def _tabular_future_forecast(model, scaler, X_full, daily_data, cols, response=R
 
 def _save_model_artifact(obj, coin: str, filename: str):
     """Pickle-save a model artifact to models/{coin}/."""
-    import pickle
-    model_dir = f'models/{coin}'
+    model_dir = os.path.join(base_dir('models'), coin)
     os.makedirs(model_dir, exist_ok=True)
     path = os.path.join(model_dir, filename)
     with open(path, 'wb') as f:
         pickle.dump(obj, f)
     return path
 
-
 def _save_metrics(value: float, coin: str, model_name: str):
     """Save standardized RMSE to both predictions/ and metrics/ folders."""
     _save_standardized_rmse(value, coin, model_name)
-    metrics_dir = f'metrics/{coin}'
+    metrics_dir = os.path.join(base_dir('metrics'), coin)
     os.makedirs(metrics_dir, exist_ok=True)
     path = f'{metrics_dir}/{model_name}_rmse.txt'
     with open(path, 'w') as f:
@@ -2007,7 +2008,7 @@ def run_transformer_pipeline(
         'val_preds': val_df, 'future_preds': future_df, 'tuning_results': tuning_results,
     }
 
-def base_dir(folders = []):
+def base_dir(folders = [], create=False):
     things = os.getcwd().split('/')
     ct2Index = things.index(REPO)
     if isinstance(folders, str):
@@ -2015,6 +2016,12 @@ def base_dir(folders = []):
     final = things[:(ct2Index+1)] + folders
     final = '/'.join(final)
 
-    if os.path.exists(final):
+    if create and not os.path.exists(final):
+        os.makedirs(final, exist_ok=True)
         return final
-    raise ValueError(f'{final} nonexistent')
+    elif not create and os.path.exists(final):
+        return final
+    elif create and os.path.exists(final):
+        return final
+    else:
+        raise ValueError('Folder already exists')
