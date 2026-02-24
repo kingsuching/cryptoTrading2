@@ -1,7 +1,7 @@
 """ARIMA model wrapper for univariate crypto price time-series forecasting."""
 import numpy as np
 import pandas as pd
-
+from statsmodels.tsa.arima.model import ARIMA
 
 class ARIMAModel:
     """Wrapper around statsmodels ARIMA for crypto price prediction.
@@ -22,7 +22,6 @@ class ARIMAModel:
 
     def fit(self, series: pd.Series) -> "ARIMAModel":
         """Fit on a univariate price series."""
-        from statsmodels.tsa.arima.model import ARIMA
         model = ARIMA(series, order=self.order)
         self._result = model.fit()
         return self

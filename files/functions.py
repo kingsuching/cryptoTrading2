@@ -2008,6 +2008,165 @@ def run_transformer_pipeline(
         'val_preds': val_df, 'future_preds': future_df, 'tuning_results': tuning_results,
     }
 
+# =============================================================================
+# PREDICTION MATRIX — registry-based design
+#
+# Each loader has signature:
+#   (coin, models_dir, data_full, X, cols, daily_data) -> (np.ndarray, DatetimeIndex)
+#
+# To add a new model:
+#   1. Write a loader function or use one of the factories below.
+#   2. Append (display_name, loader) to _MODEL_REGISTRY.
+# =============================================================================
+
+def _pm_tabular(tag: str):
+    """Factory for tabular models whose artifact is {'model': ..., 'scaler': ...}.
+
+    Covers GBM, SVM, and any future sklearn-style model saved the same way.
+    Artifact file expected: models/{coin}/{coin}_{tag}_model.pkl
+    """
+    def _load(coin, models_dir, data_full, X, cols, daily_data):
+        artifact = pickle.load(open(os.path.join(models_dir, f'{coin}_{tag}_model.pkl'), 'rb'))
+        df = _tabular_future_forecast(
+            artifact['model'], artifact['scaler'],
+            X, daily_data, cols, RESPONSE_VARIABLE, n=TEST_DAYS,
+        )
+        return df['predicted_price'].values, df.index
+    return _load
+
+
+def _pm_knn(coin, models_dir, data_full, X, cols, daily_data):
+    """Loader for KNN.
+
+    _save_knn_model uses string concat instead of os.path.join, producing a
+    doubled coin prefix in the filename (e.g. BTCBTC_knn_model.pkl) inside
+    models/{coin}/.
+    """
+    knn_model  = pickle.load(open(os.path.join(models_dir, f'{coin}{coin}_knn_model.pkl'), 'rb'))
+    knn_scaler = pickle.load(open(os.path.join(models_dir, f'{coin}{coin}_scaler.pkl'), 'rb'))
+    df = _knn_future_forecast(
+        knn_model, knn_scaler, X, daily_data, cols,
+        response=RESPONSE_VARIABLE, n=TEST_DAYS,
+    )
+    return df['predicted_price'].values, df.index
+
+
+def _pm_arima(coin, models_dir, data_full, X, cols, daily_data):
+    """Loader for ARIMA (ARIMAModel pkl, forecasts via .forecast())."""
+    arima = pickle.load(open(os.path.join(models_dir, f'{coin}_arima_model.pkl'), 'rb'))
+    vals  = np.asarray(arima.forecast(steps=TEST_DAYS))
+    idx   = generate_future_index(daily_data.index[-1], TEST_DAYS)
+    return vals, idx
+
+
+def _pm_torch_seq(tag: str, impl_module: str, impl_class: str,
+                  size_kwarg: str = 'num_features'):
+    """Factory for PyTorch sequence models (.pt state dict + _meta.pkl).
+
+    Parameters
+    ----------
+    tag         : file-name tag, e.g. 'lstm', 'tft', 'transformer'
+    impl_module : dotted import path, e.g. 'implementations.lstm_model'
+    impl_class  : class name, e.g. 'LSTMModel'
+    size_kwarg  : constructor kwarg for input width
+                  ('input_size' for LSTM, 'num_features' for TFT/Transformer)
+
+    Artifact files expected:
+      models/{coin}/{coin}_{tag}_model.pt
+      models/{coin}/{coin}_{tag}_meta.pkl
+    """
+    def _load(coin, models_dir, data_full, X, cols, daily_data):
+        import importlib
+        model_cls = getattr(importlib.import_module(impl_module), impl_class)
+
+        meta     = pickle.load(open(os.path.join(models_dir, f'{coin}_{tag}_meta.pkl'), 'rb'))
+        scaled, _, _ = normalize_data(
+            data_full, method=meta['scaler_method'], target_col=RESPONSE_VARIABLE
+        )
+        hp       = {k: v for k, v in meta['params'].items()
+                    if k not in ('seq_len', 'scaler', 'val_loss')}
+        model    = model_cls(**{size_kwarg: data_full.shape[1]}, **hp)
+        model.load_state_dict(
+            torch.load(os.path.join(models_dir, f'{coin}_{tag}_model.pt'), map_location='cpu')
+        )
+        model.eval()
+        df = _seq_future_forecast_torch(
+            model, scaled, meta['seq_len'], meta['tgt_scaler'], daily_data, n=TEST_DAYS
+        )
+        return df['predicted_price'].values, df.index
+    return _load
+
+
+def _pm_prophet(coin, models_dir, data_full, X, cols, daily_data):
+    """Loader for Prophet (ProphetWrapper pkl)."""
+    wrapper = pickle.load(open(os.path.join(models_dir, f'{coin}_prophet_model.pkl'), 'rb'))
+    df = _prophet_future_forecast(wrapper, daily_data, cols, RESPONSE_VARIABLE, n=TEST_DAYS)
+    return df['predicted_price'].values, df.index
+
+
+# ── Registry ──────────────────────────────────────────────────────────────────
+# Each entry: (display_name, loader_fn)
+# Adding a new model = one new line here; no other changes needed.
+_MODEL_REGISTRY: list = [
+    ('GBM',         _pm_tabular('gbm')),
+    ('SVM',         _pm_tabular('svm')),
+    ('KNN',         _pm_knn),
+    ('ARIMA',       _pm_arima),
+    ('LSTM',        _pm_torch_seq('lstm',
+                                  'implementations.lstm_model', 'LSTMModel',
+                                  size_kwarg='input_size')),
+    ('TFT',         _pm_torch_seq('tft',
+                                  'implementations.tft_model', 'TemporalFusionTransformer')),
+    ('Transformer', _pm_torch_seq('transformer',
+                                  'implementations.transformer_model', 'CryptoTransformer')),
+    ('Prophet',     _pm_prophet),
+]
+
+
+def predict_matrix(coin: str) -> pd.DataFrame:
+    """Load every registered model for *coin* and return an m×n DataFrame.
+
+    Iterates over ``_MODEL_REGISTRY``; models whose artifact files are missing
+    are skipped with a warning so the function stays usable when only a subset
+    of models has been trained for a given coin.
+
+    Parameters
+    ----------
+    coin : str
+        Coin symbol matching the saved model directory, e.g. ``'BTC'``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Shape (m, TEST_DAYS) — model names as index, date strings as columns,
+        predicted USD prices as values.
+    """
+    models_dir = os.path.join(base_dir(), 'models', coin)
+    data       = pd.read_csv(fullDataPath(coin))
+    daily_data = dataSetup(data, trainingColPath=TRAINING_COLUMNS,
+                           response=RESPONSE_VARIABLE, number=LIMIT)
+    cols       = trainingCols(TRAINING_COLUMNS)
+    X          = daily_data[cols].copy()
+    data_full  = daily_data[cols + [RESPONSE_VARIABLE]].copy()
+
+    preds        = {}
+    future_index = None
+
+    for name, loader in _MODEL_REGISTRY:
+        try:
+            vals, idx = loader(coin, models_dir, data_full, X, cols, daily_data)
+            preds[name] = vals
+            if future_index is None:
+                future_index = idx
+        except Exception as e:
+            print(f'  [predict_matrix] {name} skipped — {e}')
+
+    matrix = pd.DataFrame(preds, index=future_index).T
+    matrix.columns = [str(d.date()) for d in matrix.columns]
+    matrix.index.name = 'Model'
+    return matrix
+
+
 def base_dir(folders = [], create=False):
     things = os.getcwd().split('/')
     ct2Index = things.index(REPO)
@@ -2025,3 +2184,9 @@ def base_dir(folders = [], create=False):
         return final
     else:
         raise ValueError('Folder already exists')
+
+
+if __name__ == '__main__':
+    print(
+        predict_matrix('BTC')
+    )
