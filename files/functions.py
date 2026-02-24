@@ -8,13 +8,11 @@ import requests
 import torch
 from bs4 import BeautifulSoup
 from matplotlib import pyplot as plt
-from serpapi import GoogleSearch
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.preprocessing import MinMaxScaler, RobustScaler
 from torch.nn.functional import softmax
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from files import CONSTANTS
 from files.API_KEYS import *
 from files.CONSTANTS import *
@@ -73,6 +71,7 @@ def prepare_coin_data(coin: str) -> pd.DataFrame:
 
 
 def article_metadata(query):
+    from serpapi import GoogleSearch
     params = {
         "api_key": SERPAPI_KEY,
         "engine": "google_news",
@@ -134,6 +133,7 @@ def sentiment_score(x, NEGATIVE=-1, NEUTRAL=0, POSITIVE=1, MULTIPLIER=100):
 
 def get_sentiment(text):
     """HELPER FUNCTION"""
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
     MODEL = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL)
@@ -2186,7 +2186,58 @@ def base_dir(folders = [], create=False):
         raise ValueError('Folder already exists')
 
 
-if __name__ == '__main__':
-    print(
-        predict_matrix('BTC')
-    )
+def train_all_models(coin: str) -> dict:
+    """Train all 8 models for *coin* end-to-end and return their standardised RMSEs.
+
+    Calls the individual pipeline functions in sequence.  If one model fails it is
+    skipped and the rest continue.  Artifacts are saved to ``models/{coin}/`` and
+    metrics to ``metrics/{coin}/``.
+
+    Parameters
+    ----------
+    coin : str
+        Coin symbol, e.g. ``'BTC'``, ``'ETH'``.
+
+    Returns
+    -------
+    dict
+        ``{model_name: std_rmse}`` for each model.  Value is ``None`` when a model
+        failed.
+    """
+    pipelines = [
+        ('GBM',         lambda: run_gbm_pipeline(coin)),
+        ('SVM',         lambda: run_svm_pipeline(coin)),
+        ('KNN',         lambda: run_knn_pipeline(coin)),
+        ('ARIMA',       lambda: run_arima_pipeline(coin)),
+        ('LSTM',        lambda: run_lstm_pipeline(coin)),
+        ('TFT',         lambda: run_tft_pipeline(coin)),
+        ('Transformer', lambda: run_transformer_pipeline(coin)),
+        ('Prophet',     lambda: run_prophet_pipeline(coin)),
+    ]
+
+    results = {}
+    width = 60
+    print(f"\n{'=' * width}")
+    print(f"  Training all models for {coin}")
+    print(f"{'=' * width}\n")
+
+    for name, run in pipelines:
+        print(f"[{name}] starting...")
+        try:
+            out = run()
+            std_rmse = out.get('std_rmse', float('nan'))
+            results[name] = std_rmse
+            print(f"[{name}] done  —  std_rmse = {std_rmse:.4f}\n")
+        except Exception as exc:
+            print(f"[{name}] FAILED: {exc}\n")
+            results[name] = None
+
+    print(f"\n{'=' * width}")
+    print(f"  Results for {coin}")
+    print(f"{'=' * width}")
+    for name, val in sorted(results.items(),
+                            key=lambda kv: (kv[1] is None, kv[1] or 0)):
+        label = f"{val:.4f}" if val is not None else "FAILED"
+        print(f"  {name:<15}  {label}")
+
+    return results
