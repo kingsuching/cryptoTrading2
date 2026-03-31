@@ -71,7 +71,6 @@ def prepare_coin_data(coin: str) -> pd.DataFrame:
 
 
 def article_metadata(query):
-    from serpapi import GoogleSearch
     params = {
         "api_key": SERPAPI_KEY,
         "engine": "google_news",
@@ -79,11 +78,14 @@ def article_metadata(query):
         "gl": "us",
         "q": query
     }
-
-    search = GoogleSearch(params)
-    results = search.get_dict()
-    article_metadata = results['news_results']
-    return article_metadata
+    try:
+        from serpapi import GoogleSearch
+        search = GoogleSearch(params)
+        results = search.get_dict()
+    except (ImportError, AttributeError):
+        import serpapi
+        results = serpapi.search(**params)
+    return results['news_results']
 
 
 def get_newspapers(query, existing_links):
@@ -183,7 +185,7 @@ def newspaper_sentiment_pipeline(coin, newspaper_path=None, queries_path='querie
     nfq = sentimentAnalysis(nfq, NEGATIVE, NEUTRAL, POSITIVE)
 
     # Step 3: Load in the newspaper data (with sentiment) and preprocess it
-    coin_newspapers = pd.read_csv(f'../newspapers/{coin}_newspapers.csv')
+    coin_newspapers = pd.read_csv(newspaper_path)
     coin_newspapers['date'] = pd.to_datetime(coin_newspapers['date'], format="%m/%d/%Y, %I:%M %p, %z UTC")
     coin_newspapers['date'] = coin_newspapers['date'].dt.date
     coin_newspapers['score'] = nfq['score']
@@ -203,16 +205,19 @@ def newspaper_sentiment_pipeline(coin, newspaper_path=None, queries_path='querie
 
 
 def fullDataPath(coin):
+    # Derive repo root reliably from this file's location:
+    # functions.py lives at <repo_root>/files/functions.py
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     candidates = [
-        f'../data/{coin}_df.csv',
+        os.path.join(_repo_root, 'data', f'{coin}_df.csv'),  # always correct
         f'data/{coin}_df.csv',
+        f'../data/{coin}_df.csv',
         os.path.join('files', 'data', f'{coin}_df.csv'),
-        os.path.join(BASE_DIR, 'data', f'{coin}_df.csv'),
     ]
     for c in candidates:
         if os.path.exists(c):
             return c
-    return candidates[-1]
+    return candidates[0]  # repo-root path — gives a clear FileNotFoundError
 
 
 def get_fgi_data(df):
