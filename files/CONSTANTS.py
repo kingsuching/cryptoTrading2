@@ -16,7 +16,7 @@ EXPLANATORY_VARIABLES = [
     'avg_sentiment',
 ]
 EMPTY_STRING = '-'
-LIMIT = 730
+LIMIT = 365
 TRAINING_COLUMNS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'training_columns.txt')
 TRAIN_PCT = 0.8
 MODEL = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
@@ -37,7 +37,7 @@ REPO = 'cryptoTrading2'
 # =============================================================================
 # USER INPUT: Enter your investment amount here
 # =============================================================================
-LUMP_SUM = 10000  # <-- CHANGE THIS to your investment amount in USD
+LUMP_SUM = 100  # <-- CHANGE THIS to your investment amount in USD
 # =============================================================================
 
 # Risk parameters

@@ -442,6 +442,12 @@ def dataSetup(data, trainingColPath='training_columns.txt', response='close',  n
     d = {}
     trainingCols.append(response)
 
+    # If score column is missing (no newspaper data), add a zero column so
+    # avg_sentiment / tweet_count aggregations don't crash.
+    if 'score' not in data.columns:
+        data = data.copy()
+        data['score'] = 0.0
+
     # set up the aggregation dictionary kwargs
     for col in trainingCols:
         if col == 'avg_sentiment':
@@ -898,11 +904,13 @@ def _knn_future_forecast(model: KNeighborsRegressor, scaler: StandardScaler, X_f
     return future_df
 
 
-def run_knn_pipeline(coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS):
+def run_knn_pipeline(coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
+                     number: int = LIMIT):
     """End-to-end KNN pipeline: data prep, split, tune, train, validate, forecast next 7 days, save outputs."""
     model_tag = 'knn'
     daily_data, X, y, training_cols = _prepare_knn_dataset(coin, response=response,
-                                                           training_cols_path=training_cols_path)
+                                                           training_cols_path=training_cols_path,
+                                                           number=number)
     X_train, X_val, y_train, y_val = _time_series_train_val_split(X, y)
     scaler, X_train_scaled, X_val_scaled = _scale_features(X_train, X_val)
 
@@ -946,10 +954,11 @@ def run_knn_pipeline(coin: str = COIN, response: str = RESPONSE, training_cols_p
 
 # Reinstate missing KNN dataset preparation helpers (were removed in prior edit)
 
-def _prepare_knn_dataset(coin: str, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS):
+def _prepare_knn_dataset(coin: str, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
+                         number: int = LIMIT):
     raw_path = fullDataPath(coin)
     data = pd.read_csv(raw_path)
-    daily_data = dataSetup(data, trainingColPath=training_cols_path, response=response)
+    daily_data = dataSetup(data, trainingColPath=training_cols_path, response=response, number=number)
     training_cols = trainingCols(training_cols_path)
     missing = [c for c in training_cols if c not in daily_data.columns]
     assert len(missing) == 0, f"Missing training columns: {missing}"
@@ -991,10 +1000,11 @@ class ProphetWrapper:
         return self.model.predict(df_future)
 
 
-def _prepare_prophet_dataset(coin: str, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS):
+def _prepare_prophet_dataset(coin: str, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
+                              number: int = LIMIT):
     raw_path = fullDataPath(coin)
     data = pd.read_csv(raw_path)
-    daily_data = dataSetup(data, trainingColPath=training_cols_path, response=response)
+    daily_data = dataSetup(data, trainingColPath=training_cols_path, response=response, number=number)
     training_cols = trainingCols(training_cols_path)
     missing = [c for c in training_cols if c not in daily_data.columns]
     assert len(missing) == 0, f"Missing training columns: {missing}"
@@ -1168,9 +1178,11 @@ def _save_prophet_model(wrapper: ProphetWrapper, coin: str):
 
 
 def run_prophet_pipeline(coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
-                         train_pct: float = TRAIN_PCT, scaler_methods=None, forecast_days: int = TEST_DAYS):
+                         train_pct: float = TRAIN_PCT, scaler_methods=None, forecast_days: int = TEST_DAYS,
+                         number: int = LIMIT):
     """End-to-end Prophet pipeline with scaler + hyperparameter tuning. Produces one future prediction file and standardized RMSE file."""
-    daily_data, features = _prepare_prophet_dataset(coin, response=response, training_cols_path=training_cols_path)
+    daily_data, features = _prepare_prophet_dataset(coin, response=response, training_cols_path=training_cols_path,
+                                                    number=number)
     best_combo, tuning_results = _prophet_tune(daily_data, features, response, train_pct, scaler_methods=scaler_methods)
     if best_combo is None:
         raise RuntimeError('Prophet tuning failed to produce a valid model.')
@@ -1412,12 +1424,13 @@ def coinbase_market_analysis_gradient(c, dataPath, plotPath):
 # =============================================================================
 
 def _prepare_tabular_dataset(
-    coin: str, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS
+    coin: str, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
+    number: int = LIMIT,
 ):
     """Load data and return (daily_data, X, y, cols) for tabular models."""
     raw_path = fullDataPath(coin)
     data = pd.read_csv(raw_path)
-    daily_data = dataSetup(data, trainingColPath=training_cols_path, response=response)
+    daily_data = dataSetup(data, trainingColPath=training_cols_path, response=response, number=number)
     cols = trainingCols(training_cols_path)
     missing = [c for c in cols if c not in daily_data.columns]
     assert len(missing) == 0, f"Missing training columns: {missing}"
@@ -1505,12 +1518,13 @@ def _gbm_tune(X_train, y_train, param_grid: list, scaler_methods=None, n_splits:
 
 
 def run_gbm_pipeline(
-    coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS
+    coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
+    number: int = LIMIT,
 ) -> dict:
     """End-to-end GBM pipeline: load → split → tune → train → validate → forecast → save."""
     from implementations.gbm_model import GBMModel
     model_tag = 'gbm'
-    daily_data, X, y, cols = _prepare_tabular_dataset(coin, response, training_cols_path)
+    daily_data, X, y, cols = _prepare_tabular_dataset(coin, response, training_cols_path, number=number)
     X_train, X_val, y_train, y_val = _time_series_train_val_split(X, y)
     best_combo, tuning_results = _gbm_tune(X_train, y_train, _gbm_param_grid())
     if best_combo is None:
@@ -1565,14 +1579,15 @@ def _arima_grid_search(train_series: pd.Series, p_range=(0, 1, 2), d_range=(0, 1
 
 
 def run_arima_pipeline(
-    coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS
+    coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
+    number: int = LIMIT,
 ) -> dict:
     """End-to-end ARIMA pipeline (univariate on response/price series)."""
     from implementations.arima_model import ARIMAModel
     model_tag = 'arima'
     raw_path = fullDataPath(coin)
     data = pd.read_csv(raw_path)
-    daily_data = dataSetup(data, trainingColPath=training_cols_path, response=response)
+    daily_data = dataSetup(data, trainingColPath=training_cols_path, response=response, number=number)
     price_series = daily_data[response].copy()
     n = len(price_series)
     split_idx = max(1, int(n * TRAIN_PCT))
@@ -1699,7 +1714,7 @@ def _lstm_param_grid() -> list:
 def run_lstm_pipeline(
     coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
     lr: float = 1e-3, epochs: int = 50, batch_size: int = 32, patience: int = 10,
-    scaler_methods: list = None,
+    scaler_methods: list = None, number: int = LIMIT,
 ) -> dict:
     """End-to-end LSTM pipeline."""
     import torch
@@ -1708,7 +1723,7 @@ def run_lstm_pipeline(
         scaler_methods = ['minmax', 'standard']
     model_tag = 'lstm'
     device = _get_device()
-    daily_data, X_df, y_s, cols = _prepare_tabular_dataset(coin, response, training_cols_path)
+    daily_data, X_df, y_s, cols = _prepare_tabular_dataset(coin, response, training_cols_path, number=number)
     data_full = daily_data[cols + [response]].copy()
     param_grid = _lstm_param_grid()
     best_score, best_combo = np.inf, None
@@ -1820,12 +1835,13 @@ def _svm_tune(X_train, y_train, param_grid: list, scaler_methods=None, n_splits:
 
 
 def run_svm_pipeline(
-    coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS
+    coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
+    number: int = LIMIT,
 ) -> dict:
     """End-to-end SVM pipeline: load → split → tune → train → validate → forecast → save."""
     from implementations.svm_model import SVMModel
     model_tag = 'svm'
-    daily_data, X, y, cols = _prepare_tabular_dataset(coin, response, training_cols_path)
+    daily_data, X, y, cols = _prepare_tabular_dataset(coin, response, training_cols_path, number=number)
     X_train, X_val, y_train, y_val = _time_series_train_val_split(X, y)
     best_combo, tuning_results = _svm_tune(X_train, y_train, _svm_param_grid())
     if best_combo is None:
@@ -1869,14 +1885,14 @@ def _tft_param_grid() -> list:
 def run_tft_pipeline(
     coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
     lr: float = 1e-3, epochs: int = 50, batch_size: int = 32, patience: int = 10,
-    seq_len: int = 30, scaler_method: str = 'minmax',
+    seq_len: int = 30, scaler_method: str = 'minmax', number: int = LIMIT,
 ) -> dict:
     """End-to-end TFT pipeline."""
     import torch
     from implementations.tft_model import TemporalFusionTransformer
     model_tag = 'tft'
     device = _get_device()
-    daily_data, X_df, y_s, cols = _prepare_tabular_dataset(coin, response, training_cols_path)
+    daily_data, X_df, y_s, cols = _prepare_tabular_dataset(coin, response, training_cols_path, number=number)
     data_full = daily_data[cols + [response]].copy()
     scaled_data, feat_sc, tgt_sc = normalize_data(data_full, method=scaler_method, target_col=response)
     X_seq, y_seq = create_sequences(scaled_data, sequence_length=seq_len, prediction_horizon=1)
@@ -1949,14 +1965,14 @@ def _transformer_param_grid() -> list:
 def run_transformer_pipeline(
     coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
     lr: float = 1e-3, epochs: int = 50, batch_size: int = 32, patience: int = 10,
-    seq_len: int = 30, scaler_method: str = 'minmax',
+    seq_len: int = 30, scaler_method: str = 'minmax', number: int = LIMIT,
 ) -> dict:
     """End-to-end simple Transformer pipeline."""
     import torch
     from implementations.transformer_model import CryptoTransformer
     model_tag = 'transformer'
     device = _get_device()
-    daily_data, X_df, y_s, cols = _prepare_tabular_dataset(coin, response, training_cols_path)
+    daily_data, X_df, y_s, cols = _prepare_tabular_dataset(coin, response, training_cols_path, number=number)
     data_full = daily_data[cols + [response]].copy()
     scaled_data, feat_sc, tgt_sc = normalize_data(data_full, method=scaler_method, target_col=response)
     X_seq, y_seq = create_sequences(scaled_data, sequence_length=seq_len, prediction_horizon=1)
@@ -2191,7 +2207,7 @@ def base_dir(folders = [], create=False):
         raise ValueError('Folder already exists')
 
 
-def train_all_models(coin: str) -> dict:
+def train_all_models(coin: str, number: int = LIMIT) -> dict:
     """Train all 8 models for *coin* end-to-end and return their standardised RMSEs.
 
     Calls the individual pipeline functions in sequence.  If one model fails it is
@@ -2202,6 +2218,8 @@ def train_all_models(coin: str) -> dict:
     ----------
     coin : str
         Coin symbol, e.g. ``'BTC'``, ``'ETH'``.
+    number : int
+        Number of most-recent daily rows to use for training (default LIMIT=730).
 
     Returns
     -------
@@ -2210,14 +2228,14 @@ def train_all_models(coin: str) -> dict:
         failed.
     """
     pipelines = [
-        ('GBM',         lambda: run_gbm_pipeline(coin)),
-        ('SVM',         lambda: run_svm_pipeline(coin)),
-        ('KNN',         lambda: run_knn_pipeline(coin)),
-        ('ARIMA',       lambda: run_arima_pipeline(coin)),
-        ('LSTM',        lambda: run_lstm_pipeline(coin)),
-        ('TFT',         lambda: run_tft_pipeline(coin)),
-        ('Transformer', lambda: run_transformer_pipeline(coin)),
-        ('Prophet',     lambda: run_prophet_pipeline(coin)),
+        ('GBM',         lambda: run_gbm_pipeline(coin, number=number)),
+        ('SVM',         lambda: run_svm_pipeline(coin, number=number)),
+        ('KNN',         lambda: run_knn_pipeline(coin, number=number)),
+        ('ARIMA',       lambda: run_arima_pipeline(coin, number=number)),
+        ('LSTM',        lambda: run_lstm_pipeline(coin, number=number)),
+        ('TFT',         lambda: run_tft_pipeline(coin, number=number)),
+        ('Transformer', lambda: run_transformer_pipeline(coin, number=number)),
+        ('Prophet',     lambda: run_prophet_pipeline(coin, number=number)),
     ]
 
     results = {}

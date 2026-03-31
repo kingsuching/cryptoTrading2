@@ -1,7 +1,9 @@
 import os
 import re
 import sys
+import json
 import subprocess
+from itertools import product as _iproduct, combinations as _icombinations
 from pathlib import Path
 from files.CONSTANTS import *
 import numpy as np
@@ -73,21 +75,37 @@ def _load_rmse(coin: str) -> dict:
 
 
 def _current_price(coin: str) -> float | None:
+    """Return the most recent daily close price directly from the CSV."""
     try:
-        raw   = pd.read_csv(fullDataPath(coin))
-        daily = dataSetup(raw, trainingColPath=TRAINING_COLUMNS,
-                          response=RESPONSE_VARIABLE, number=LIMIT)
-        return float(daily[RESPONSE_VARIABLE].iloc[-1])
+        raw = pd.read_csv(fullDataPath(coin))
+        raw['time'] = pd.to_datetime(raw['time'], errors='coerce')
+        raw = raw.dropna(subset=['time'])
+        # Group by date and take the last close for each day (handles intraday rows)
+        daily = raw.groupby(raw['time'].dt.date)[RESPONSE_VARIABLE].last()
+        return float(daily.iloc[-1])
     except Exception:
         return None
 
 
 @st.cache_data(show_spinner=False)
 def _available_coins() -> list[str]:
-    pred_base = base_dir('predictions')
-    return [c for c in COINS
-            if any(f.startswith(c) and '_future_predictions.csv' in f
-                   for f in os.listdir(pred_base))]
+    """All coins that have a data CSV AND at least one future-prediction file."""
+    data_dir  = os.path.join(str(_root), 'data')
+    pred_base = base_dir('predictions') or os.path.join(str(_root), 'predictions')
+    data_coins = set()
+    if os.path.exists(data_dir):
+        for f in os.listdir(data_dir):
+            if f.endswith('_df.csv'):
+                data_coins.add(f.replace('_df.csv', ''))
+    pred_coins = set()
+    if os.path.exists(pred_base):
+        for f in os.listdir(pred_base):
+            if '_future_predictions.csv' in f:
+                for c in data_coins:
+                    if f.startswith(c):
+                        pred_coins.add(c)
+                        break
+    return sorted(pred_coins)
 
 
 @st.cache_data(show_spinner=False)
@@ -125,40 +143,67 @@ def _build_ensemble(coins: tuple) -> tuple:
 # Portfolio optimisation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_optimization(principal: float, coins: list[str]) -> dict | None:
-    """Run the RMSE-weighted ensemble + optimal-exit portfolio algorithm.
+def _softmax(arr: np.ndarray) -> np.ndarray:
+    e = np.exp(arr - arr.max())
+    return e / e.sum()
 
-    Returns a dict with all outputs, or None if data is missing.
+
+def _optimal_portfolio(cum_ret_df: pd.DataFrame, principal: float):
+    """Search every non-empty subset of coins × every exit-day combination.
+
+    Returns (best_coins, opt_days_dict, alloc_w_array, best_portfolio_value).
+    Complexity: (1 + n_days)^N − 1 evaluations  (e.g. 8^6 ≈ 262k for 6 coins).
     """
+    all_coins = list(cum_ret_df.columns)
+    n_days    = len(cum_ret_df)
+    arr       = cum_ret_df.values.astype(float)        # (n_days, n_coins)
+    cidx      = {c: i for i, c in enumerate(all_coins)}
+
+    best_V     = -np.inf
+    best_coins = all_coins[:1]
+    best_days  = {all_coins[0]: 0}
+    best_w     = np.array([1.0])
+
+    for size in range(1, len(all_coins) + 1):
+        for subset in _icombinations(all_coins, size):
+            sub = arr[:, [cidx[c] for c in subset]]   # (n_days, size)
+            for combo in _iproduct(range(n_days), repeat=size):
+                r = np.array([sub[combo[i], i] for i in range(size)])
+                w = _softmax(r)
+                V = principal * (1.0 + float(np.dot(w, r)))
+                if V > best_V:
+                    best_V     = V
+                    best_coins = list(subset)
+                    best_days  = {subset[i]: combo[i] for i in range(size)}
+                    best_w     = w
+
+    return best_coins, best_days, best_w, best_V
+
+
+def run_optimization(principal: float, coins: list[str]) -> dict | None:
+    """Build ensemble → search all coin-subsets × exit-days for max portfolio value."""
     ensemble_df, curr_prices = _build_ensemble(tuple(coins))
-    valid = [c for c in coins if c in ensemble_df.columns and c in curr_prices]
-    if not valid:
+    # Only keep coins for which we have both predictions and a current price
+    candidates = [c for c in coins if c in ensemble_df.columns and c in curr_prices]
+    if not candidates:
         return None
 
-    ensemble_df = ensemble_df[valid]
+    ensemble_df = ensemble_df[candidates]
     n_days      = len(ensemble_df)
 
     # ── Cumulative returns from current price ─────────────────────────────────
-    cum_ret = pd.DataFrame(index=ensemble_df.index, columns=valid, dtype=float)
-    for coin in valid:
-        cp            = curr_prices[coin]
-        cum_ret[coin] = (ensemble_df[coin] - cp) / cp
+    cum_ret = pd.DataFrame(index=ensemble_df.index, columns=candidates, dtype=float)
+    for coin in candidates:
+        cum_ret[coin] = (ensemble_df[coin] - curr_prices[coin]) / curr_prices[coin]
 
-    opt_days    = {c: int(cum_ret[c].values.argmax())    for c in valid}
+    # ── Optimal subset + exit days ────────────────────────────────────────────
+    best_coins, opt_days, alloc_w, _ = _optimal_portfolio(cum_ret, principal)
+
+    # Restrict everything to the winning subset
+    valid   = best_coins
+    alloc_w = alloc_w   # softmax weights, already computed
+
     opt_returns = {c: float(cum_ret[c].iloc[opt_days[c]]) for c in valid}
-
-    # ── Capital allocation ────────────────────────────────────────────────────
-    # Prefer positive-return coins; if none exist, allocate to the least-negative.
-    ret_arr  = np.array([opt_returns[c] for c in valid])
-    pos      = np.maximum(ret_arr, 0.0)
-    total    = pos.sum()
-    if total > 0:
-        alloc_w = pos / total
-    else:
-        # All returns are ≤ 0 — shift so best coin = max weight, worst = 0
-        shifted = ret_arr - ret_arr.min()          # all ≥ 0, best coin is largest
-        s       = shifted.sum()
-        alloc_w = shifted / s if s > 0 else np.ones(len(valid)) / len(valid)
 
     # ── Day-by-day simulation ─────────────────────────────────────────────────
     cash       = principal * float(1 - alloc_w.sum())
@@ -174,12 +219,19 @@ def run_optimization(principal: float, coins: list[str]) -> dict | None:
     today_row = {'Date': 'Today', 'Portfolio ($)': principal,
                  'Daily Δ (%)': '—', 'vs Principal (%)': '—', 'Cash ($)': round(cash, 2)}
     for cidx2, coin in enumerate(valid):
-        today_row[f'{coin} Price ($)']  = f"${curr_prices[coin]:,.2f}"
-        today_row[f'{coin} Value ($)']  = round(holdings[coin], 2)
-        today_row[f'{coin} Action']     = 'BUY 🟢' if alloc_w[cidx2] > 0 else 'SKIP ⚪'
+        is_buy = alloc_w[cidx2] > 0
+        units  = buy_units[coin]
+        today_row[f'{coin} Price ($)'] = f"${curr_prices[coin]:,.2f}"
+        today_row[f'{coin} Action']    = 'BUY 🟢' if is_buy else 'SKIP ⚪'
+        today_row[f'{coin} Units']     = f"+{units:.6f}" if is_buy else '—'
+        today_row[f'{coin} Txn ($)']   = round(-holdings[coin], 2) if is_buy else 0.0
+        today_row[f'{coin} Value ($)'] = round(holdings[coin], 2)
     schedule_rows.append(today_row)
 
     for i, date in enumerate(ensemble_df.index):
+        # Capture units before liquidation so SELL row shows correct qty
+        units_before = {c: buy_units[c] if holdings[c] > 0 else 0.0 for c in valid}
+
         # Liquidate on optimal exit day
         for coin in valid:
             if i == opt_days[coin] and holdings[coin] > 0:
@@ -191,8 +243,8 @@ def run_optimization(principal: float, coins: list[str]) -> dict | None:
         coin_values = {}
         for coin in valid:
             if holdings[coin] > 0:
-                pred            = float(ensemble_df[coin].iloc[i])
-                bp              = buy_price[coin]
+                pred              = float(ensemble_df[coin].iloc[i])
+                bp                = buy_price[coin]
                 coin_values[coin] = holdings[coin] * (1 + (pred - bp) / bp)
             else:
                 coin_values[coin] = 0.0
@@ -208,29 +260,41 @@ def run_optimization(principal: float, coins: list[str]) -> dict | None:
                'Cash ($)': round(cash, 2)}
 
         for cidx3, coin in enumerate(valid):
-            w3  = alloc_w[cidx3]
+            w3      = alloc_w[cidx3]
             pred_px = float(ensemble_df[coin].iloc[i])
+            u_before = units_before[coin]   # units held before any liquidation this day
+
             if w3 <= 0:
-                action = 'SKIP ⚪'
-            elif i < opt_days[coin]:
-                action = 'HOLD 🟡'
+                action   = 'SKIP ⚪'
+                units_str = '—'
+                txn       = 0.0
             elif i == opt_days[coin]:
-                action = 'SELL 🔴'
+                action    = 'SELL 🔴'
+                units_str = f"-{u_before:.6f}"
+                txn       = round(u_before * pred_px, 2)   # cash received
+            elif i < opt_days[coin]:
+                action    = 'HOLD 🟡'
+                units_str = f"{buy_units[coin]:.6f}"
+                txn       = 0.0
             else:
-                action = 'CASH 💵'
-            # Value = units * predicted close price (0 once sold)
+                action    = 'CASH 💵'
+                units_str = '—'
+                txn       = 0.0
+
             coin_val = round(buy_units[coin] * pred_px, 2) if holdings[coin] > 0 else 0.0
             row[f'{coin} Price ($)'] = f"${pred_px:,.2f}"
-            row[f'{coin} Value ($)'] = coin_val
             row[f'{coin} Action']    = action
+            row[f'{coin} Units']     = units_str
+            row[f'{coin} Txn ($)']   = txn
+            row[f'{coin} Value ($)'] = coin_val
         schedule_rows.append(row)
 
     schedule_df = pd.DataFrame(schedule_rows).set_index('Date')
 
-    # Reorder columns: per-coin (Price → Value → Action), then Cash, then portfolio metrics
+    # Reorder columns: per-coin (Price → Action → Units → Txn$ → Value$), then summary cols
     _coin_cols = []
     for _c in valid:
-        for _sfx in [' Price ($)', ' Value ($)', ' Action']:
+        for _sfx in [' Price ($)', ' Action', ' Units', ' Txn ($)', ' Value ($)']:
             _col = f'{_c}{_sfx}'
             if _col in schedule_df.columns:
                 _coin_cols.append(_col)
@@ -299,6 +363,36 @@ def run_optimization(principal: float, coins: list[str]) -> dict | None:
 # Retrain helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _spawn_train(coins: list[str], number: int) -> subprocess.Popen:
+    """Fetch fresh data then run train_all_models for every coin in a background subprocess."""
+    script = f"""
+import sys, os
+sys.path.insert(0, {repr(str(_root))})
+os.chdir({repr(str(_root))})
+from files.functions import coinbase_market_analysis_gradient, train_all_models
+coins  = {coins!r}
+number = {number}
+for coin in coins:
+    print(f'[{{coin}}] Fetching fresh market data...', flush=True)
+    try:
+        coinbase_market_analysis_gradient(coin, dataPath='data', plotPath='plots')
+        print(f'[{{coin}}] Data ready.', flush=True)
+    except Exception as e:
+        print(f'[{{coin}}] Data fetch failed: {{e}}', flush=True)
+    print(f'[{{coin}}] Training all models (last {{number}} days)...', flush=True)
+    results = train_all_models(coin, number=number)
+    ok  = [k for k, v in results.items() if v is not None]
+    bad = [k for k, v in results.items() if v is None]
+    print(f'[{{coin}}] Done — passed: {{ok}}, failed: {{bad}}', flush=True)
+print('All coins finished.', flush=True)
+"""
+    return subprocess.Popen(
+        [sys.executable, '-c', script],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        cwd=str(_root),
+    )
+
+
 def _add_coin_to_constants(coin: str) -> bool:
     """Append *coin* to the COINS list in CONSTANTS.py. Returns True if added, False if already present."""
     constants_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'CONSTANTS.py')
@@ -360,6 +454,52 @@ st.caption("RMSE-weighted ensemble of GBM · SVM · KNN · ARIMA · LSTM · TFT 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.header("🏋️ Train Models")
+
+    train_coins_raw = st.text_input(
+        "Coins to train (comma-separated)",
+        value=', '.join(COINS),
+        help="Fetches the latest market data, then retrains all models for each coin.",
+        key="train_coins_input",
+    )
+    train_days = st.number_input(
+        "Training days (most recent)",
+        min_value=30, max_value=3650, value=365, step=30,
+        help="How many days of data to use, counting back from today. Default 365.",
+        key="train_days_input",
+    )
+    train_btn = st.button("🚀 Fetch Data & Train", type="primary", use_container_width=True)
+
+    if train_btn:
+        parsed_train = [c.strip().upper() for c in train_coins_raw.split(',') if c.strip()]
+        if not parsed_train:
+            st.warning("Enter at least one coin code.")
+        else:
+            st.session_state['train_proc']  = _spawn_train(parsed_train, int(train_days))
+            st.session_state['train_coins'] = parsed_train
+            st.session_state['auto_optimize'] = False
+            st.info(f"Training started for **{', '.join(parsed_train)}** "
+                    f"using last **{int(train_days)}** days — this may take several minutes.")
+
+    # Training status
+    if 'train_proc' in st.session_state:
+        tp: subprocess.Popen = st.session_state['train_proc']
+        if tp.poll() is None:
+            st.warning("⏳ Training in progress…")
+        else:
+            out, _ = tp.communicate()
+            if tp.returncode == 0:
+                st.success("✅ Training complete — portfolio will refresh.")
+                _available_coins.clear()
+                _build_ensemble.clear()
+                st.session_state['auto_optimize'] = True
+            else:
+                st.error("Training finished with errors — check log.")
+            with st.expander("Training log"):
+                st.code(out or "(no output)")
+            del st.session_state['train_proc']
+
+    st.divider()
     st.header("⚙️ Parameters")
 
     lump_sum = st.number_input(
@@ -372,12 +512,42 @@ with st.sidebar:
     )
 
     available = _available_coins()
+    # Include any newly trained coins that session state may have added
+    _extra = [c for c in st.session_state.get('extra_coins', []) if c in available]
+    _default = list(dict.fromkeys(available + _extra))   # preserve order, no dupes
     selected_coins = st.multiselect(
-        "Coins to include",
-        options=available,
-        default=available,
-        help="Only coins with trained model predictions are shown.",
+        "Candidate coins (optimizer auto-selects best subset)",
+        options=_default,
+        default=_default,
+        help="All coins with trained predictions. The optimizer automatically picks the subset and exit days that maximise portfolio value.",
     )
+
+    # ── Add a brand-new coin inline ───────────────────────────────────────────
+    _nc_col, _nb_col = st.columns([3, 1])
+    new_portfolio_coin = _nc_col.text_input(
+        "Add new coin",
+        placeholder="e.g. DOGE",
+        label_visibility="collapsed",
+        key="new_portfolio_coin",
+    ).strip().upper()
+    add_coin_btn = _nb_col.button("➕ Add", use_container_width=True)
+
+    if add_coin_btn:
+        if not new_portfolio_coin:
+            st.warning("Enter a coin code first.")
+        elif new_portfolio_coin in available:
+            st.info(f"**{new_portfolio_coin}** already has trained models — select it above.")
+        else:
+            _add_coin_to_constants(new_portfolio_coin)
+            st.session_state['train_proc']  = _spawn_train([new_portfolio_coin], int(train_days))
+            st.session_state['train_coins'] = [new_portfolio_coin]
+            st.session_state['auto_optimize'] = False
+            extras = st.session_state.get('extra_coins', [])
+            if new_portfolio_coin not in extras:
+                extras.append(new_portfolio_coin)
+            st.session_state['extra_coins'] = extras
+            st.info(f"Fetching data & training **{new_portfolio_coin}** — "
+                    "it will appear in the list when done.")
 
     run_btn = st.button("🚀 Run Optimization", type="primary", use_container_width=True)
 
@@ -424,7 +594,8 @@ with st.sidebar:
             del st.session_state['retrain_proc']
 
 # ── Main area ─────────────────────────────────────────────────────────────────
-if not run_btn:
+auto_optimize = st.session_state.pop('auto_optimize', False)
+if not run_btn and not auto_optimize:
     st.info("👈 Set your lump sum, select coins, and click **Run Optimization**.")
     st.stop()
 
@@ -445,252 +616,260 @@ total_ret_pct  = (final_value / lump_sum - 1) * 100
 net_gain       = final_value - lump_sum
 
 # ── Key metrics ───────────────────────────────────────────────────────────────
-st.subheader("📊 7-Day Forecast Summary")
+st.subheader("📊 Forecast Summary")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Principal",           f"${lump_sum:,.2f}")
-c2.metric("Final Portfolio",     f"${final_value:,.2f}",   delta=f"{total_ret_pct:+.2f}%")
-c3.metric("Net Gain / Loss",     f"${net_gain:+,.2f}",     delta=f"{total_ret_pct:+.2f}%")
-c4.metric("Coins Invested",      f"{int((result['alloc_w'] > 0).sum())} / {len(selected_coins)}")
+c1.metric("Principal",        f"${lump_sum:,.2f}")
+c2.metric("Final Portfolio",  f"${final_value:,.2f}", delta=f"{total_ret_pct:+.2f}%")
+c3.metric("Net Gain / Loss",  f"${net_gain:+,.2f}",  delta=f"{total_ret_pct:+.2f}%")
+_best = result['valid_coins']
+c4.metric("Coins Selected",   f"{len(_best)} of {len(selected_coins)} candidates",
+          help=f"Auto-selected: {', '.join(_best)}")
 
-# ── Portfolio value + daily returns (two-panel Plotly chart) ─────────────────
-st.subheader("💹 Portfolio Value & Daily Returns")
+# ── Daily Action Plan ────────────────────────────────────────────────────────
+st.subheader("📋 Daily Trading Instructions")
+st.caption(f"Optimal portfolio: **{', '.join(result['valid_coins'])}** — "
+           f"auto-selected from {len(selected_coins)} candidates to maximise portfolio value.")
 
-pv   = result['pv_series']
-rets = result['ret_series']
+_sched      = result['schedule']
+_valid      = result['valid_coins']
+_curr_px    = result['curr_prices']
+_buy_units  = {c: result['alloc_w'][i] * lump_sum / _curr_px[c]
+               for i, c in enumerate(_valid)}
+_exit_days  = result['opt_days']
+
+_ACTION_ICON = {'BUY 🟢': '🟢', 'SELL 🔴': '🔴', 'HOLD 🟡': '🟡', 'CASH 💵': '💵', 'SKIP ⚪': '⚪'}
+
+for _day_idx, (_date, _row) in enumerate(_sched.iterrows()):
+    # Determine which coins are transacting today
+    _selling = [c for c in _valid if f'{c} Action' in _row.index and 'SELL' in str(_row[f'{c} Action'])]
+    _buying  = [c for c in _valid if f'{c} Action' in _row.index and 'BUY'  in str(_row[f'{c} Action'])]
+    if _selling:
+        _day_label = f"**{'TODAY' if _day_idx == 0 else f'Day {_day_idx}'} — {_date}** &nbsp; 🔴 SELL: {', '.join(_selling)}"
+    elif _buying:
+        _day_label = f"**{'TODAY' if _day_idx == 0 else f'Day {_day_idx}'} — {_date}** &nbsp; 🟢 BUY: {', '.join(_buying)}"
+    else:
+        _day_label = f"**{'TODAY' if _day_idx == 0 else f'Day {_day_idx}'} — {_date}** &nbsp; 🟡 HOLD ALL"
+
+    with st.expander(_day_label, expanded=(_day_idx == 0 or bool(_selling))):
+        _cols = st.columns([1, 1, 1, 1, 1])
+        _cols[0].markdown("**Coin**")
+        _cols[1].markdown("**Action**")
+        _cols[2].markdown("**Units**")
+        _cols[3].markdown("**@ Price**")
+        _cols[4].markdown("**Amount / Value**")
+        st.divider()
+
+        for _c in _valid:
+            _action  = str(_row.get(f'{_c} Action', '—'))
+            _units_s = str(_row.get(f'{_c} Units', '—'))
+            _price_s = str(_row.get(f'{_c} Price ($)', '—'))
+            _txn     = _row.get(f'{_c} Txn ($)', 0.0)
+            _val     = _row.get(f'{_c} Value ($)', 0.0)
+            _cols2   = st.columns([1, 1, 1, 1, 1])
+            _cols2[0].write(f"**{_c}**")
+            _cols2[1].write(_action)
+            _cols2[2].write(_units_s)
+            _cols2[3].write(_price_s)
+            # Amount: show transaction if BUY/SELL, else current value
+            if 'SELL' in _action and _txn:
+                _buy_spent = _buy_units.get(_c, 0) * _curr_px.get(_c, 0)
+                _gain      = float(_txn) - _buy_spent
+                _cols2[4].markdown(
+                    f"<span style='color:#155724;font-weight:bold'>"
+                    f"+${float(_txn):,.2f} &nbsp;({_gain:+,.2f})</span>",
+                    unsafe_allow_html=True,
+                )
+            elif 'BUY' in _action and _txn:
+                _cols2[4].markdown(
+                    f"<span style='color:#721c24;font-weight:bold'>"
+                    f"−${abs(float(_txn)):,.2f}</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                _cols2[4].write(f"${float(_val):,.2f}" if _val else "—")
+
+        st.divider()
+        _pv   = _row.get('Portfolio ($)', 0.0)
+        _cash = _row.get('Cash ($)', 0.0)
+        _d1, _d2, _d3 = st.columns(3)
+        _d1.metric("Portfolio Value", f"${float(_pv):,.2f}")
+        _d2.metric("Cash",            f"${float(_cash):,.2f}")
+        _d3.metric("vs Principal",    _row.get('vs Principal (%)', '—'))
+
+st.divider()
+
+# ── Charts (collapsible) ─────────────────────────────────────────────────────
+pv        = result['pv_series']
+rets      = result['ret_series']
 dates_all = result['dates_all']
+pv_vals   = pv.values.tolist()
 
-fig = make_subplots(
-    rows=2, cols=1,
-    shared_xaxes=True,
-    row_heights=[0.65, 0.35],
-    vertical_spacing=0.06,
-    subplot_titles=('Portfolio Value (USD)', 'Day-over-Day Return (%)'),
-)
-
-# ── Top panel: portfolio value ────────────────────────────────────────────────
-pv_vals = pv.values.tolist()
-
-# Gain fill (green above principal)
-fig.add_trace(go.Scatter(
-    x=dates_all, y=[max(v, lump_sum) for v in pv_vals],
-    fill=None, mode='lines', line=dict(width=0), showlegend=False,
-), row=1, col=1)
-fig.add_trace(go.Scatter(
-    x=dates_all, y=[lump_sum] * len(dates_all),
-    fill='tonexty', mode='lines', line=dict(width=0),
-    fillcolor='rgba(76,175,80,0.18)', name='Gain', showlegend=True,
-), row=1, col=1)
-
-# Loss fill (red below principal)
-fig.add_trace(go.Scatter(
-    x=dates_all, y=[min(v, lump_sum) for v in pv_vals],
-    fill=None, mode='lines', line=dict(width=0), showlegend=False,
-), row=1, col=1)
-fig.add_trace(go.Scatter(
-    x=dates_all, y=[lump_sum] * len(dates_all),
-    fill='tonexty', mode='lines', line=dict(width=0),
-    fillcolor='rgba(244,67,54,0.18)', name='Loss', showlegend=True,
-), row=1, col=1)
-
-# Principal line
-fig.add_hline(y=lump_sum, line_dash='dash', line_color='gray',
-              annotation_text=f'Principal ${lump_sum:,.0f}',
-              annotation_position='bottom right', row=1, col=1)
-
-# Portfolio value line
-fig.add_trace(go.Scatter(
-    x=dates_all,
-    y=pv_vals,
-    mode='lines+markers+text',
-    line=dict(color='#2196F3', width=2.5),
-    marker=dict(size=8),
-    text=[f'${v:,.0f}' for v in pv_vals],
-    textposition='top center',
-    textfont=dict(size=11),
-    name='Portfolio Value',
-), row=1, col=1)
-
-# ── Optimal exit markers on portfolio value chart ─────────────────────────────
-coin_colors = ['#FF9800', '#9C27B0', '#F44336', '#00BCD4', '#795548', '#E91E63']
-for cidx, coin in enumerate(result['valid_coins']):
-    w = result['alloc_w'][cidx]
-    if w <= 0:
-        continue
-    exit_idx   = result['opt_days'][coin] + 1          # +1 because dates_all[0]='Today'
-    exit_date  = dates_all[exit_idx]
-    exit_pv    = pv_vals[exit_idx]
-    exit_ret   = result['opt_returns'][coin] * 100
-    color      = coin_colors[cidx % len(coin_colors)]
-
-    # Vertical dashed line through both panels
-    fig.add_vline(x=exit_date, line_dash='dot', line_color=color,
-                  line_width=1.5, row='all', col=1)
-
-    # Star marker at portfolio value on exit day
+with st.expander("💹 Portfolio Value & Returns Chart", expanded=True):
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.65, 0.35], vertical_spacing=0.06,
+        subplot_titles=('Portfolio Value (USD)', 'Day-over-Day Return (%)'),
+    )
     fig.add_trace(go.Scatter(
-        x=[exit_date],
-        y=[exit_pv],
-        mode='markers+text',
-        marker=dict(symbol='star', size=18, color=color,
-                    line=dict(color='white', width=1)),
-        text=[f'SELL {coin}<br>{exit_ret:+.2f}%'],
-        textposition='bottom center',
-        textfont=dict(size=10, color=color),
-        name=f'Sell {coin}',
-        showlegend=True,
+        x=dates_all, y=[max(v, lump_sum) for v in pv_vals],
+        fill=None, mode='lines', line=dict(width=0), showlegend=False,
     ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=dates_all, y=[lump_sum] * len(dates_all),
+        fill='tonexty', mode='lines', line=dict(width=0),
+        fillcolor='rgba(76,175,80,0.18)', name='Gain', showlegend=True,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=dates_all, y=[min(v, lump_sum) for v in pv_vals],
+        fill=None, mode='lines', line=dict(width=0), showlegend=False,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=dates_all, y=[lump_sum] * len(dates_all),
+        fill='tonexty', mode='lines', line=dict(width=0),
+        fillcolor='rgba(244,67,54,0.18)', name='Loss', showlegend=True,
+    ), row=1, col=1)
+    fig.add_hline(y=lump_sum, line_dash='dash', line_color='gray',
+                  annotation_text=f'Principal ${lump_sum:,.0f}',
+                  annotation_position='bottom right', row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=dates_all, y=pv_vals,
+        mode='lines+markers+text', line=dict(color='#2196F3', width=2.5),
+        marker=dict(size=8),
+        text=[f'${v:,.0f}' for v in pv_vals], textposition='top center',
+        textfont=dict(size=11), name='Portfolio Value',
+    ), row=1, col=1)
+    coin_colors = ['#FF9800', '#9C27B0', '#F44336', '#00BCD4', '#795548', '#E91E63']
+    for cidx, coin in enumerate(result['valid_coins']):
+        exit_idx  = result['opt_days'][coin] + 1
+        exit_date = dates_all[exit_idx]
+        color     = coin_colors[cidx % len(coin_colors)]
+        fig.add_vline(x=exit_date, line_dash='dot', line_color=color, line_width=1.5, row='all', col=1)
+        fig.add_trace(go.Scatter(
+            x=[exit_date], y=[pv_vals[exit_idx]], mode='markers+text',
+            marker=dict(symbol='star', size=18, color=color, line=dict(color='white', width=1)),
+            text=[f'SELL {coin}<br>{result["opt_returns"][coin]*100:+.2f}%'],
+            textposition='bottom center', textfont=dict(size=10, color=color),
+            name=f'Sell {coin}', showlegend=True,
+        ), row=1, col=1)
+    ret_vals = rets.values.tolist()
+    fig.add_trace(go.Bar(
+        x=dates_all, y=ret_vals,
+        marker_color=['#4CAF50' if r >= 0 else '#F44336' for r in ret_vals],
+        text=[f'{r:+.2f}%' for r in ret_vals], textposition='outside',
+        textfont=dict(size=10), name='Daily Return', showlegend=False,
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_color='gray', line_width=1, row=2, col=1)
+    fig.update_yaxes(tickprefix='$', tickformat=',.0f', row=1, col=1)
+    fig.update_yaxes(ticksuffix='%', row=2, col=1)
+    fig.update_layout(height=580, margin=dict(t=40, b=20),
+                      legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                      plot_bgcolor='white')
+    fig.update_xaxes(showgrid=True, gridcolor='#f0f0f0')
+    fig.update_yaxes(showgrid=True, gridcolor='#f0f0f0')
+    st.plotly_chart(fig, use_container_width=True)
 
-# ── Bottom panel: day-over-day returns ────────────────────────────────────────
-ret_vals   = rets.values.tolist()
-bar_colors_ret = ['#4CAF50' if r >= 0 else '#F44336' for r in ret_vals]
-
-fig.add_trace(go.Bar(
-    x=dates_all,
-    y=ret_vals,
-    marker_color=bar_colors_ret,
-    text=[f'{r:+.2f}%' for r in ret_vals],
-    textposition='outside',
-    textfont=dict(size=10),
-    name='Daily Return',
-    showlegend=False,
-), row=2, col=1)
-fig.add_hline(y=0, line_color='gray', line_width=1, row=2, col=1)
-
-fig.update_yaxes(tickprefix='$', tickformat=',.0f', row=1, col=1)
-fig.update_yaxes(ticksuffix='%', row=2, col=1)
-fig.update_layout(
-    height=580,
-    margin=dict(t=40, b=20),
-    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-    plot_bgcolor='white',
-)
-fig.update_xaxes(showgrid=True, gridcolor='#f0f0f0')
-fig.update_yaxes(showgrid=True, gridcolor='#f0f0f0')
-
-st.plotly_chart(fig, use_container_width=True)
-
-# ── Per-coin predicted-price returns chart ────────────────────────────────────
-st.subheader("📈 Predicted Price Returns by Coin (Day-over-Day)")
-
-fig2 = go.Figure()
-line_colors = ['#2196F3', '#FF9800', '#4CAF50', '#9C27B0', '#F44336', '#00BCD4']
-for idx, coin in enumerate(result['valid_coins']):
-    rets_coin  = result['coin_returns'][coin]
-    line_color = line_colors[idx % len(line_colors)]
-    exit_idx   = result['opt_days'][coin] + 1   # +1 for 'Today' offset
-    exit_ret   = result['opt_returns'][coin] * 100
-
-    # Regular line + markers
-    fig2.add_trace(go.Scatter(
-        x=dates_all,
-        y=rets_coin,
-        mode='lines+markers+text',
-        name=coin,
-        line=dict(color=line_color, width=2),
-        marker=dict(size=7, color=line_color),
-        text=[f'{r:+.2f}%' for r in rets_coin],
-        textposition='top center',
-        textfont=dict(size=9),
-    ))
-
-    # Star at optimal exit day
-    fig2.add_trace(go.Scatter(
-        x=[dates_all[exit_idx]],
-        y=[rets_coin[exit_idx]],
-        mode='markers+text',
-        marker=dict(symbol='star', size=18, color=line_color,
-                    line=dict(color='white', width=1)),
-        text=[f'Max exit<br>{exit_ret:+.2f}% total'],
-        textposition='bottom center',
-        textfont=dict(size=9, color=line_color),
-        showlegend=False,
-    ))
-
-    # Vertical dashed line at exit day
-    fig2.add_vline(x=dates_all[exit_idx], line_dash='dot',
-                   line_color=line_color, line_width=1.5)
-
-fig2.add_hline(y=0, line_dash='dash', line_color='gray', line_width=1)
-fig2.update_layout(
-    yaxis_title='Return vs Previous Day (%)',
-    yaxis_ticksuffix='%',
-    height=360,
-    margin=dict(t=20, b=20),
-    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-    plot_bgcolor='white',
-)
-fig2.update_xaxes(showgrid=True, gridcolor='#f0f0f0')
-fig2.update_yaxes(showgrid=True, gridcolor='#f0f0f0')
-
-st.plotly_chart(fig2, use_container_width=True)
+with st.expander("📈 Predicted Price Returns by Coin"):
+    fig2 = go.Figure()
+    line_colors = ['#2196F3', '#FF9800', '#4CAF50', '#9C27B0', '#F44336', '#00BCD4']
+    for idx, coin in enumerate(result['valid_coins']):
+        rets_coin  = result['coin_returns'][coin]
+        lc         = line_colors[idx % len(line_colors)]
+        exit_idx   = result['opt_days'][coin] + 1
+        fig2.add_trace(go.Scatter(
+            x=dates_all, y=rets_coin, mode='lines+markers+text', name=coin,
+            line=dict(color=lc, width=2), marker=dict(size=7, color=lc),
+            text=[f'{r:+.2f}%' for r in rets_coin], textposition='top center',
+            textfont=dict(size=9),
+        ))
+        fig2.add_trace(go.Scatter(
+            x=[dates_all[exit_idx]], y=[rets_coin[exit_idx]], mode='markers+text',
+            marker=dict(symbol='star', size=18, color=lc, line=dict(color='white', width=1)),
+            text=[f'Exit<br>{result["opt_returns"][coin]*100:+.2f}%'],
+            textposition='bottom center', textfont=dict(size=9, color=lc), showlegend=False,
+        ))
+        fig2.add_vline(x=dates_all[exit_idx], line_dash='dot', line_color=lc, line_width=1.5)
+    fig2.add_hline(y=0, line_dash='dash', line_color='gray', line_width=1)
+    fig2.update_layout(yaxis_title='Return vs Previous Day (%)', yaxis_ticksuffix='%',
+                       height=360, margin=dict(t=20, b=20), plot_bgcolor='white',
+                       legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1))
+    fig2.update_xaxes(showgrid=True, gridcolor='#f0f0f0')
+    fig2.update_yaxes(showgrid=True, gridcolor='#f0f0f0')
+    st.plotly_chart(fig2, use_container_width=True)
 
 # ── Allocation table ──────────────────────────────────────────────────────────
-st.subheader("🎯 Capital Allocation")
-alloc_df    = result['allocation']
-invested    = alloc_df[alloc_df['Allocation (%)'] > 0]
-cash_pct    = 100.0 - invested['Allocation (%)'].sum()
-cash_amount = lump_sum * cash_pct / 100
+with st.expander("🎯 Capital Allocation"):
+    alloc_df  = result['allocation']
+    invested  = alloc_df[alloc_df['Allocation (%)'] > 0]
+    cash_pct  = 100.0 - invested['Allocation (%)'].sum()
+    if not invested.empty:
+        st.dataframe(
+            invested.style
+                .format({'Allocation (%)': '{:.1f}%', 'Amount ($)': '${:,.2f}',
+                         'Current Price ($)': '${:,.2f}', 'Expected Return (%)': '{:+.2f}%'})
+                .background_gradient(subset=['Expected Return (%)'], cmap='RdYlGn'),
+            use_container_width=True, hide_index=True,
+        )
+    if cash_pct > 0.5:
+        st.info(f"💵 **{cash_pct:.1f}%** (${lump_sum*cash_pct/100:,.2f}) stays in cash.")
 
-if not invested.empty:
-    st.dataframe(
-        invested.style
-            .format({'Allocation (%)': '{:.1f}%', 'Amount ($)': '${:,.2f}',
-                     'Current Price ($)': '${:,.2f}', 'Expected Return (%)': '{:+.2f}%'})
-            .background_gradient(subset=['Expected Return (%)'], cmap='RdYlGn'),
-        use_container_width=True,
-        hide_index=True,
+# ── Detailed schedule table ───────────────────────────────────────────────────
+with st.expander("📅 Full Day-by-Day Schedule Table"):
+    sched       = result['schedule'].copy()
+    action_cols = [c for c in sched.columns if c.endswith(' Action')]
+    value_cols  = [c for c in sched.columns if c.endswith(' Value ($)')]
+    txn_cols    = [c for c in sched.columns if c.endswith(' Txn ($)')]
+
+    def _color_action(val):
+        if 'BUY'  in str(val): return 'background-color:#d4edda;color:#155724;font-weight:bold'
+        if 'SELL' in str(val): return 'background-color:#f8d7da;color:#721c24;font-weight:bold'
+        if 'HOLD' in str(val): return 'background-color:#fff3cd;color:#856404'
+        return ''
+
+    def _color_txn(val):
+        try:
+            v = float(val)
+            if v > 0: return 'color:#155724;font-weight:bold'
+            if v < 0: return 'color:#721c24;font-weight:bold'
+        except Exception:
+            pass
+        return ''
+
+    def _color_delta(val):
+        try:
+            v = float(str(val).replace('%','').replace('+','').replace('—','0'))
+            if v > 0: return 'color:#155724'
+            if v < 0: return 'color:#721c24'
+        except Exception:
+            pass
+        return ''
+
+    def _color_vp(val):
+        try:
+            v = float(str(val).replace('%','').replace('+','').replace('—','0'))
+            if v > 0: return 'background-color:#d4edda;color:#155724;font-weight:bold'
+            if v < 0: return 'background-color:#f8d7da;color:#721c24;font-weight:bold'
+        except Exception:
+            pass
+        return ''
+
+    styled_sched = (
+        sched.style
+            .applymap(_color_action, subset=action_cols)
+            .applymap(_color_txn,    subset=txn_cols)
+            .applymap(_color_delta,  subset=['Daily Δ (%)'])
+            .applymap(_color_vp,     subset=['vs Principal (%)'])
+            .format({'Portfolio ($)': '${:,.2f}', 'Cash ($)': '${:,.2f}',
+                     **{c: '${:,.2f}'  for c in value_cols},
+                     **{c: '${:+,.2f}' for c in txn_cols}})
     )
+    st.dataframe(styled_sched, use_container_width=True)
+    st.caption("Txn ($): negative = cash spent, positive = cash received. Units = coin quantity.")
 
-if cash_pct > 0.01:
-    st.info(f"💵 **{cash_pct:.1f}%** (${cash_amount:,.2f}) stays in cash.")
-
-# ── Day-by-day schedule ───────────────────────────────────────────────────────
-st.subheader("📅 Day-by-Day Trading Schedule")
-
-sched = result['schedule'].copy()
-action_cols = [c for c in sched.columns if 'Action' in c]
-price_cols  = [c for c in sched.columns if 'Price' in c]
-value_cols  = [c for c in sched.columns if 'Value ($)' in c]
-
-def _color_action(val):
-    if 'BUY'  in str(val): return 'background-color: #d4edda; color: #155724'
-    if 'SELL' in str(val): return 'background-color: #f8d7da; color: #721c24'
-    if 'HOLD' in str(val): return 'background-color: #fff3cd; color: #856404'
-    return ''
-
-def _color_delta(val):
-    try:
-        v = float(str(val).replace('%', '').replace('+', '').replace('—', '0'))
-        if v > 0:  return 'color: #155724'
-        if v < 0:  return 'color: #721c24'
-    except Exception:
-        pass
-    return ''
-
-def _color_vs_principal(val):
-    try:
-        v = float(str(val).replace('%', '').replace('+', '').replace('—', '0'))
-        if v > 0:  return 'background-color: #d4edda; color: #155724; font-weight: bold'
-        if v < 0:  return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
-    except Exception:
-        pass
-    return ''
-
-_value_fmt = {c: '${:,.2f}' for c in value_cols}
-styled_sched = (
-    sched.style
-        .applymap(_color_action,       subset=action_cols)
-        .applymap(_color_delta,        subset=['Daily Δ (%)'])
-        .applymap(_color_vs_principal, subset=['vs Principal (%)'])
-        .format({'Portfolio ($)': '${:,.2f}', 'Cash ($)': '${:,.2f}', **_value_fmt})
-)
-st.dataframe(styled_sched, use_container_width=True)
-
-# ── Ensemble forecast table ───────────────────────────────────────────────────
+# ── Ensemble forecast ─────────────────────────────────────────────────────────
 with st.expander("🔮 Model Ensemble Forecast Prices"):
     ens = result['ensemble_df'].copy()
     ens.index.name = 'Date'
-    fmt = {c: '${:,.2f}' for c in ens.columns}
-    st.dataframe(ens.style.format(fmt).background_gradient(cmap='RdYlGn', axis=0),
+    st.dataframe(ens.style.format({c: '${:,.2f}' for c in ens.columns})
+                           .background_gradient(cmap='RdYlGn', axis=0),
                  use_container_width=True)
-    st.caption("Each column is the RMSE-weighted average prediction across all trained models.")
+    st.caption("RMSE-weighted average prediction across all trained models.")
