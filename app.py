@@ -393,6 +393,30 @@ print('All coins finished.', flush=True)
     )
 
 
+def _spawn_notebook(coins: list[str]) -> subprocess.Popen:
+    """Replace myCoins in START_HERE.ipynb and execute the full pipeline notebook."""
+    import json as _json
+    nb_path = str(_root / 'START_HERE.ipynb')
+    with open(nb_path) as fh:
+        nb = _json.load(fh)
+    coins_repr = repr(coins)
+    for cell in nb['cells']:
+        if cell['cell_type'] == 'code':
+            src = cell['source'] if isinstance(cell['source'], str) else ''.join(cell['source'])
+            if src.strip().startswith('myCoins'):
+                cell['source'] = f'myCoins = {coins_repr}'
+                break
+    with open(nb_path, 'w') as fh:
+        _json.dump(nb, fh, indent=1)
+    return subprocess.Popen(
+        [sys.executable, '-m', 'jupyter', 'nbconvert',
+         '--to', 'notebook', '--execute', '--inplace',
+         '--ExecutePreprocessor.timeout=3600', nb_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        cwd=str(_root),
+    )
+
+
 def _add_coin_to_constants(coin: str) -> bool:
     """Append *coin* to the COINS list in CONSTANTS.py. Returns True if added, False if already present."""
     constants_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'CONSTANTS.py')
@@ -505,7 +529,7 @@ with st.sidebar:
     lump_sum = st.number_input(
         "Lump Sum (USD $)",
         min_value=1.0,
-        value=10_000.0,
+        value=100.0,
         step=100.0,
         format="%.2f",
         help="Total capital to invest across all selected coins.",
@@ -549,7 +573,21 @@ with st.sidebar:
             st.info(f"Fetching data & training **{new_portfolio_coin}** — "
                     "it will appear in the list when done.")
 
+    pipeline_coins_raw = st.text_input(
+        "Candidate coins for full pipeline (comma-separated)",
+        placeholder="e.g. BTC, ETH, LTC",
+        help="Replaces myCoins in START_HERE.ipynb, then runs data fetch → train → predict.",
+        key="pipeline_coins_input",
+    )
+
     run_btn = st.button("🚀 Run Optimization", type="primary", use_container_width=True)
+
+    if run_btn:
+        parsed_pipeline = [c.strip().upper() for c in pipeline_coins_raw.split(',') if c.strip()]
+        if parsed_pipeline:
+            st.session_state['nb_proc'] = _spawn_notebook(parsed_pipeline)
+            st.info(f"Starting full pipeline for **{', '.join(parsed_pipeline)}** — "
+                    "this may take several minutes.")
 
     st.divider()
     st.caption("Models are weighted by **1 / RMSE** — "
@@ -595,6 +633,26 @@ with st.sidebar:
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 auto_optimize = st.session_state.pop('auto_optimize', False)
+
+if 'nb_proc' in st.session_state:
+    _np = st.session_state['nb_proc']
+    if _np.poll() is None:
+        st.info("⏳ Full notebook pipeline is running — reload the page to check completion.")
+        st.stop()
+    else:
+        _nb_out, _ = _np.communicate()
+        if _np.returncode == 0:
+            st.success("✅ Notebook pipeline complete — running portfolio optimization.")
+            _available_coins.clear()
+            _build_ensemble.clear()
+            auto_optimize = True
+        else:
+            st.error("Notebook pipeline finished with errors.")
+            with st.expander("Notebook log"):
+                st.code(_nb_out or "(no output)")
+            st.stop()
+        del st.session_state['nb_proc']
+
 if not run_btn and not auto_optimize:
     st.info("👈 Set your lump sum, select coins, and click **Run Optimization**.")
     st.stop()

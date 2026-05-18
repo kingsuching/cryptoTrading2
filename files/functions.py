@@ -160,15 +160,17 @@ def newspapers_from_queries(coin, queries_path):
 
     newspapers = pd.DataFrame()
     links = []
-    if os.path.exists(PATH):
-        newspapers = pd.read_csv(PATH)
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(_repo_root, 'newspapers', f'{coin}_newspapers.csv')
+    if os.path.exists(path):
+        newspapers = pd.read_csv(path)
         links = newspapers['link'].tolist()
     for q in tqdm(queries):
         stuff = get_newspapers(q, links)
         newspapers = pd.concat([newspapers, stuff], ignore_index=True)
 
-    os.makedirs(os.path.dirname(PATH), exist_ok=True)
-    newspapers.to_csv(PATH, index=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    newspapers.to_csv(path, index=True)
     return newspapers
 
 
@@ -184,12 +186,10 @@ def newspaper_sentiment_pipeline(coin, newspaper_path=None, queries_path='querie
     # Step 2: sentiment analysis
     nfq = sentimentAnalysis(nfq, NEGATIVE, NEUTRAL, POSITIVE)
 
-    # Step 3: Load in the newspaper data (with sentiment) and preprocess it
-    coin_newspapers = pd.read_csv(newspaper_path)
+    # Step 3: Preprocess the in-memory newspaper data (already has sentiment from step 2)
+    coin_newspapers = nfq.copy()
     coin_newspapers['date'] = pd.to_datetime(coin_newspapers['date'], format="%m/%d/%Y, %I:%M %p, %z UTC")
     coin_newspapers['date'] = coin_newspapers['date'].dt.date
-    coin_newspapers['score'] = nfq['score']
-    coin_newspapers['sentiment'] = nfq['sentiment']
 
     # Step 4: Merge the newspaper data with the full/market data
     df = pd.read_csv(fullDataPath(coin))
@@ -2207,7 +2207,7 @@ def base_dir(folders = [], create=False):
         raise ValueError('Folder already exists')
 
 
-def train_all_models(coin: str, number: int = LIMIT) -> dict:
+def train_all_models(coin: str, number: int = LIMIT, retrain: bool = False) -> dict:
     """Train all 8 models for *coin* end-to-end and return their standardised RMSEs.
 
     Calls the individual pipeline functions in sequence.  If one model fails it is
@@ -2220,6 +2220,8 @@ def train_all_models(coin: str, number: int = LIMIT) -> dict:
         Coin symbol, e.g. ``'BTC'``, ``'ETH'``.
     number : int
         Number of most-recent daily rows to use for training (default LIMIT=730).
+    retrain : bool
+        When False (default), skip any model whose artifact file already exists.
 
     Returns
     -------
@@ -2227,6 +2229,18 @@ def train_all_models(coin: str, number: int = LIMIT) -> dict:
         ``{model_name: std_rmse}`` for each model.  Value is ``None`` when a model
         failed.
     """
+    _models_dir = os.path.join(base_dir('models'), coin)
+    _artifact = {
+        'GBM':         os.path.join(_models_dir, f'{coin}_gbm_model.pkl'),
+        'SVM':         os.path.join(_models_dir, f'{coin}_svm_model.pkl'),
+        'KNN':         os.path.join(_models_dir, f'{coin}{coin}_knn_model.pkl'),
+        'ARIMA':       os.path.join(_models_dir, f'{coin}_arima_model.pkl'),
+        'LSTM':        os.path.join(_models_dir, f'{coin}_lstm_model.pt'),
+        'TFT':         os.path.join(_models_dir, f'{coin}_tft_model.pt'),
+        'Transformer': os.path.join(_models_dir, f'{coin}_transformer_model.pt'),
+        'Prophet':     os.path.join(_models_dir, f'{coin}_prophet_model.pkl'),
+    }
+
     pipelines = [
         ('GBM',         lambda: run_gbm_pipeline(coin, number=number)),
         ('SVM',         lambda: run_svm_pipeline(coin, number=number)),
@@ -2245,6 +2259,10 @@ def train_all_models(coin: str, number: int = LIMIT) -> dict:
     print(f"{'=' * width}\n")
 
     for name, run in pipelines:
+        if not retrain and os.path.exists(_artifact[name]):
+            print(f"[{name}] skipping — artifact already exists\n")
+            results[name] = None
+            continue
         print(f"[{name}] starting...")
         try:
             out = run()
