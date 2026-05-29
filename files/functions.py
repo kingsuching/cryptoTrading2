@@ -23,6 +23,7 @@ from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
 from pathlib import Path
 from typing import Tuple, Dict
 import pickle
+import datetime as dt
 
 BASE_DIR = os.path.dirname(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -874,10 +875,10 @@ def _save_standardized_rmse(value: float, coin: str, model_name: str):
 
 
 def _save_knn_model(model: KNeighborsRegressor, scaler: StandardScaler, coin: str):
-    model_path = os.path.join(base_dir('models'), coin)
-    model_path += f'{coin}_knn_model.pkl'
-    scaler_path = os.path.join(base_dir('models'), coin)
-    scaler_path += f'{coin}_scaler.pkl'
+    model_dir = os.path.join(base_dir('models'), coin)
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, f'{coin}{coin}_knn_model.pkl')
+    scaler_path = os.path.join(model_dir, f'{coin}{coin}_scaler.pkl')
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
     with open(scaler_path, 'wb') as f:
@@ -1778,7 +1779,8 @@ def run_lstm_pipeline(
     _save_validation_predictions(val_df, coin, model_tag)
     _save_metrics(std_rmse, coin, model_tag)
     torch.save(best_model.state_dict(), f'models/{coin}/{coin}_lstm_model.pt')
-    _save_model_artifact({'feat_scaler': feat_sc, 'tgt_scaler': tgt_sc, 'params': best_combo}, coin, f'{coin}_lstm_meta.pkl')
+    _save_model_artifact({'feat_scaler': feat_sc, 'tgt_scaler': tgt_sc, 'params': best_combo,
+                          'seq_len': seq_len, 'scaler_method': sm}, coin, f'{coin}_lstm_meta.pkl')
     future_df = _seq_future_forecast_torch(best_model, scaled_data, seq_len, tgt_sc, daily_data)
     _save_future_predictions(future_df, coin, model_tag)
     return {
@@ -2059,12 +2061,6 @@ def _pm_tabular(tag: str):
 
 
 def _pm_knn(coin, models_dir, data_full, X, cols, daily_data):
-    """Loader for KNN.
-
-    _save_knn_model uses string concat instead of os.path.join, producing a
-    doubled coin prefix in the filename (e.g. BTCBTC_knn_model.pkl) inside
-    models/{coin}/.
-    """
     knn_model  = pickle.load(open(os.path.join(models_dir, f'{coin}{coin}_knn_model.pkl'), 'rb'))
     knn_scaler = pickle.load(open(os.path.join(models_dir, f'{coin}{coin}_scaler.pkl'), 'rb'))
     df = _knn_future_forecast(
@@ -2187,6 +2183,7 @@ def predict_matrix(coin: str) -> pd.DataFrame:
     matrix = pd.DataFrame(preds, index=future_index).T
     matrix.columns = [str(d.date()) for d in matrix.columns]
     matrix.index.name = 'Model'
+    matrix.index = matrix.index.str.upper()
     return matrix
 
 
@@ -2296,6 +2293,8 @@ def train_all_models(coin: str, number: int = LIMIT, retrain: bool = False) -> d
     return results
 
 def refetch(coin_path):
+    # determines whether or not data needs to be refetched based on if the data continues up to today
+    # i.e. if today is 2026-05-29 but the latest record is 2026-05-28, data will be reloaded
     try:
         coin_df = pd.read_csv(coin_path)
         max_date = str(coin_df['time'].max())
@@ -2308,6 +2307,6 @@ def refetch(coin_path):
         monthBool = now.month == month
         dayBool = now.day == day
         return not (yearBool & monthBool & dayBool)
-    except:
-        print('Error returning false')
-        return False
+    except Exception as e:
+        print(f'Error: {str(e)}')
+        return True
