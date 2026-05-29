@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import json
+import select
+import time
 import subprocess
 from itertools import product as _iproduct, combinations as _icombinations
 from pathlib import Path
@@ -23,6 +25,22 @@ _root = next(
 os.chdir(str(_root))
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
+
+def _read_proc_output(proc: subprocess.Popen) -> str:
+    """Drain all lines currently available on proc.stdout without blocking."""
+    if proc.stdout is None:
+        return ''
+    lines = []
+    while True:
+        ready, _, _ = select.select([proc.stdout], [], [], 0)
+        if not ready:
+            break
+        line = proc.stdout.readline()
+        if not line:
+            break
+        lines.append(line)
+    return ''.join(lines)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
@@ -508,10 +526,18 @@ with st.sidebar:
     # Training status
     if 'train_proc' in st.session_state:
         tp: subprocess.Popen = st.session_state['train_proc']
+        new_chunk = _read_proc_output(tp)
+        if new_chunk:
+            st.session_state['train_output'] = st.session_state.get('train_output', '') + new_chunk
+        train_out_so_far = st.session_state.get('train_output', '')
         if tp.poll() is None:
             st.warning("⏳ Training in progress…")
+            st.code(train_out_so_far or "(starting…)", language=None)
+            time.sleep(2)
+            st.rerun()
         else:
-            out, _ = tp.communicate()
+            remaining, _ = tp.communicate()
+            full_out = train_out_so_far + (remaining or '')
             if tp.returncode == 0:
                 st.success("✅ Training complete — portfolio will refresh.")
                 _available_coins.clear()
@@ -520,8 +546,9 @@ with st.sidebar:
             else:
                 st.error("Training finished with errors — check log.")
             with st.expander("Training log"):
-                st.code(out or "(no output)")
+                st.code(full_out or "(no output)", language=None)
             del st.session_state['train_proc']
+            st.session_state.pop('train_output', None)
 
     st.divider()
     st.header("⚙️ Parameters")
@@ -573,20 +600,12 @@ with st.sidebar:
             st.info(f"Fetching data & training **{new_portfolio_coin}** — "
                     "it will appear in the list when done.")
 
-    pipeline_coins_raw = st.text_input(
-        "Candidate coins for full pipeline (comma-separated)",
-        placeholder="e.g. BTC, ETH, LTC",
-        help="Replaces myCoins in START_HERE.ipynb, then runs data fetch → train → predict.",
-        key="pipeline_coins_input",
-    )
-
     run_btn = st.button("🚀 Run Optimization", type="primary", use_container_width=True)
 
     if run_btn:
-        parsed_pipeline = [c.strip().upper() for c in pipeline_coins_raw.split(',') if c.strip()]
-        if parsed_pipeline:
-            st.session_state['nb_proc'] = _spawn_notebook(parsed_pipeline)
-            st.info(f"Starting full pipeline for **{', '.join(parsed_pipeline)}** — "
+        if selected_coins:
+            st.session_state['nb_proc'] = _spawn_notebook(selected_coins)
+            st.info(f"Starting full pipeline for **{', '.join(selected_coins)}** — "
                     "this may take several minutes.")
 
     st.divider()
@@ -636,11 +655,19 @@ auto_optimize = st.session_state.pop('auto_optimize', False)
 
 if 'nb_proc' in st.session_state:
     _np = st.session_state['nb_proc']
+    _new_chunk = _read_proc_output(_np)
+    if _new_chunk:
+        st.session_state['nb_output'] = st.session_state.get('nb_output', '') + _new_chunk
+    _nb_out_so_far = st.session_state.get('nb_output', '')
     if _np.poll() is None:
-        st.info("⏳ Full notebook pipeline is running — reload the page to check completion.")
+        st.info("⏳ Full notebook pipeline is running…")
+        st.code(_nb_out_so_far or "(starting…)", language=None)
+        time.sleep(2)
+        st.rerun()
         st.stop()
     else:
-        _nb_out, _ = _np.communicate()
+        _remaining, _ = _np.communicate()
+        _full_nb_out = _nb_out_so_far + (_remaining or '')
         if _np.returncode == 0:
             st.success("✅ Notebook pipeline complete — running portfolio optimization.")
             _available_coins.clear()
@@ -649,9 +676,10 @@ if 'nb_proc' in st.session_state:
         else:
             st.error("Notebook pipeline finished with errors.")
             with st.expander("Notebook log"):
-                st.code(_nb_out or "(no output)")
+                st.code(_full_nb_out or "(no output)", language=None)
             st.stop()
         del st.session_state['nb_proc']
+        st.session_state.pop('nb_output', None)
 
 if not run_btn and not auto_optimize:
     st.info("👈 Set your lump sum, select coins, and click **Run Optimization**.")

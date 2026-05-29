@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 import re
 import time
 from datetime import datetime, timedelta
@@ -945,7 +946,7 @@ def run_knn_pipeline(coin: str = COIN, response: str = RESPONSE, training_cols_p
     return {
         'best_params': best_params,
         'rmse': rmse,
-        'standardized_rmse': std_rmse,
+        'std_rmse': std_rmse,
         'validation_predictions': val_df,
         'future_predictions': future_df,
         'tuning_results': tuning_results
@@ -1041,10 +1042,10 @@ def _prophet_scale(daily_data: pd.DataFrame, features: list, target: str, method
 def _prophet_param_grid():
     return list(ParameterGrid({
         'seasonality_mode': ['additive', 'multiplicative'],
-        'changepoint_prior_scale': [0.01, 0.1, 0.5],
-        'seasonality_prior_scale': [1.0, 5.0, 10.0],
-        'weekly_fourier_order': [3, 5],
-        'yearly_seasonality': [True, False]
+        'changepoint_prior_scale': [0.05, 0.3, 0.5],
+        'seasonality_prior_scale': [5.0],
+        'weekly_fourier_order': [3],
+        'yearly_seasonality': [True],
     }))
 
 
@@ -1057,7 +1058,8 @@ def _prophet_train_single(train_df: pd.DataFrame, features: list, params: dict):
         yearly_seasonality=params['yearly_seasonality'],
         seasonality_mode=params['seasonality_mode'],
         changepoint_prior_scale=params['changepoint_prior_scale'],
-        seasonality_prior_scale=params['seasonality_prior_scale']
+        seasonality_prior_scale=params['seasonality_prior_scale'],
+        uncertainty_samples=0,
     )
     # Add weekly custom seasonality
     model.add_seasonality(name='weekly', period=7, fourier_order=params['weekly_fourier_order'])
@@ -1100,7 +1102,7 @@ def _prophet_inverse_target(values: np.ndarray, target_scaler, method: str):
 
 def _prophet_tune(daily_data: pd.DataFrame, features: list, target: str, train_pct: float, scaler_methods=None):
     if scaler_methods is None:
-        scaler_methods = ['standard', 'minmax', 'robust']
+        scaler_methods = ['standard', 'minmax']
     param_grid = _prophet_param_grid()
     best_score = np.inf
     best_combo = None
@@ -1194,27 +1196,21 @@ def run_prophet_pipeline(coin: str = COIN, response: str = RESPONSE, training_co
     wrapper = ProphetWrapper(final_model, target_scaler, feature_scaler, features, best_combo['scaler_method'],
                              best_combo['params'])
     future_df = _prophet_future_forecast(wrapper, daily_data, features, response, n=forecast_days)
-    correct_path = os.path.join(base_dir('predictions'), coin)
     # Save artifacts
-    os.makedirs(f'{correct_path}/{coin}', exist_ok=True)
-    future_path = f'{correct_path}/{coin}/prophet_future_predictions.csv'
-    future_df.to_csv(future_path, index=True)
-    std_rmse_path = f'{correct_path}/{coin}/prophet_standardized_rmse.txt'
-    with open(std_rmse_path, 'w') as f:
-        f.write(f"{best_combo['standardized_rmse']:.6f}\n")
+    std_rmse_val = best_combo['standardized_rmse']
+    _save_metrics(std_rmse_val, coin, 'prophet')
+    future_path = _save_future_predictions(future_df, coin, 'prophet')
     model_path = _save_prophet_model(wrapper, coin)
-    # Save tuning results
-    tuning_path = f'{correct_path}/{coin}/prophet_tuning_results.csv'
+    tuning_path = os.path.join(base_dir('predictions'), f'{coin}prophet_tuning_results.csv')
     pd.DataFrame(tuning_results).sort_values('standardized_rmse').to_csv(tuning_path, index=False)
     return {
         'best_params': best_combo['params'],
         'scaler_method': best_combo['scaler_method'],
         'rmse': best_combo['rmse'],
-        'standardized_rmse': best_combo['standardized_rmse'],
+        'std_rmse': std_rmse_val,
         'future_predictions': future_df,
         'model_path': model_path,
         'future_path': future_path,
-        'std_rmse_path': std_rmse_path,
         'tuning_path': tuning_path
     }
 
@@ -1885,7 +1881,7 @@ def _tft_param_grid() -> list:
 def run_tft_pipeline(
     coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
     lr: float = 1e-3, epochs: int = 50, batch_size: int = 32, patience: int = 10,
-    seq_len: int = 30, scaler_method: str = 'minmax', number: int = LIMIT,
+    seq_len: int = TEST_DAYS, scaler_method: str = 'minmax', number: int = LIMIT,
 ) -> dict:
     """End-to-end TFT pipeline."""
     import torch
@@ -1896,6 +1892,9 @@ def run_tft_pipeline(
     data_full = daily_data[cols + [response]].copy()
     scaled_data, feat_sc, tgt_sc = normalize_data(data_full, method=scaler_method, target_col=response)
     X_seq, y_seq = create_sequences(scaled_data, sequence_length=seq_len, prediction_horizon=1)
+    if len(X_seq) < 10:
+        raise ValueError(f'Not enough sequences for TFT training (got {len(X_seq)}, need ≥10). '
+                         f'Try reducing seq_len or providing more data.')
     n_train = max(1, int(len(X_seq) * TRAIN_PCT))
     X_tr = torch.tensor(X_seq[:n_train], dtype=torch.float32)
     y_tr = torch.tensor(y_seq[:n_train].flatten(), dtype=torch.float32)
@@ -1965,7 +1964,7 @@ def _transformer_param_grid() -> list:
 def run_transformer_pipeline(
     coin: str = COIN, response: str = RESPONSE, training_cols_path: str = TRAINING_COLUMNS,
     lr: float = 1e-3, epochs: int = 50, batch_size: int = 32, patience: int = 10,
-    seq_len: int = 30, scaler_method: str = 'minmax', number: int = LIMIT,
+    seq_len: int = TEST_DAYS, scaler_method: str = 'minmax', number: int = LIMIT,
 ) -> dict:
     """End-to-end simple Transformer pipeline."""
     import torch
@@ -1976,6 +1975,9 @@ def run_transformer_pipeline(
     data_full = daily_data[cols + [response]].copy()
     scaled_data, feat_sc, tgt_sc = normalize_data(data_full, method=scaler_method, target_col=response)
     X_seq, y_seq = create_sequences(scaled_data, sequence_length=seq_len, prediction_horizon=1)
+    if len(X_seq) < 10:
+        raise ValueError(f'Not enough sequences for Transformer training (got {len(X_seq)}, need ≥10). '
+                         f'Try reducing seq_len or providing more data.')
     n_train = max(1, int(len(X_seq) * TRAIN_PCT))
     X_tr = torch.tensor(X_seq[:n_train], dtype=torch.float32)
     y_tr = torch.tensor(y_seq[:n_train].flatten(), dtype=torch.float32)
@@ -2238,7 +2240,7 @@ def train_all_models(coin: str, number: int = LIMIT, retrain: bool = False) -> d
         'LSTM':        os.path.join(_models_dir, f'{coin}_lstm_model.pt'),
         'TFT':         os.path.join(_models_dir, f'{coin}_tft_model.pt'),
         'Transformer': os.path.join(_models_dir, f'{coin}_transformer_model.pt'),
-        'Prophet':     os.path.join(_models_dir, f'{coin}_prophet_model.pkl'),
+        # 'Prophet':     os.path.join(_models_dir, f'{coin}_prophet_model.pkl'),
     }
 
     pipelines = [
@@ -2249,10 +2251,11 @@ def train_all_models(coin: str, number: int = LIMIT, retrain: bool = False) -> d
         ('LSTM',        lambda: run_lstm_pipeline(coin, number=number)),
         ('TFT',         lambda: run_tft_pipeline(coin, number=number)),
         ('Transformer', lambda: run_transformer_pipeline(coin, number=number)),
-        ('Prophet',     lambda: run_prophet_pipeline(coin, number=number)),
+        # ('Prophet',     lambda: run_prophet_pipeline(coin, number=number)),
     ]
 
     results = {}
+    skipped = set()
     width = 60
     print(f"\n{'=' * width}")
     print(f"  Training all models for {coin}")
@@ -2262,6 +2265,7 @@ def train_all_models(coin: str, number: int = LIMIT, retrain: bool = False) -> d
         if not retrain and os.path.exists(_artifact[name]):
             print(f"[{name}] skipping — artifact already exists\n")
             results[name] = None
+            skipped.add(name)
             continue
         print(f"[{name}] starting...")
         try:
@@ -2270,7 +2274,10 @@ def train_all_models(coin: str, number: int = LIMIT, retrain: bool = False) -> d
             results[name] = std_rmse
             print(f"[{name}] done  —  std_rmse = {std_rmse:.4f}\n")
         except Exception as exc:
-            print(f"[{name}] FAILED: {exc}\n")
+            import traceback
+            print(f"[{name}] FAILED: {exc}")
+            traceback.print_exc()
+            print()
             results[name] = None
 
     print(f"\n{'=' * width}")
@@ -2278,7 +2285,29 @@ def train_all_models(coin: str, number: int = LIMIT, retrain: bool = False) -> d
     print(f"{'=' * width}")
     for name, val in sorted(results.items(),
                             key=lambda kv: (kv[1] is None, kv[1] or 0)):
-        label = f"{val:.4f}" if val is not None else "FAILED"
+        if name in skipped:
+            label = "SKIPPED"
+        elif val is None:
+            label = "FAILED"
+        else:
+            label = f"{val:.4f}"
         print(f"  {name:<15}  {label}")
 
     return results
+
+def refetch(coin_path):
+    try:
+        coin_df = pd.read_csv(coin_path)
+        max_date = str(coin_df['time'].max())
+        items = max_date.split('-')
+        year = int(items[0])
+        month = int(items[1])
+        day = int(items[2])
+        now = dt.datetime.now()
+        yearBool = now.year == year
+        monthBool = now.month == month
+        dayBool = now.day == day
+        return not (yearBool & monthBool & dayBool)
+    except:
+        print('Error returning false')
+        return False
