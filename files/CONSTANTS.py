@@ -24,7 +24,11 @@ PATH = f'../newspapers/BTC_newspapers.csv'
 SLEEP = 3
 FILL = -99999999.0
 TEST_DAYS = 7 # do not change
-COINS = ['BTC', 'ETH', 'LTC', 'XRP', 'BCH', 'SOL', 'AVAX']
+COINS = [
+    'BTC', 'AVAX', 'ETH', 'LTC', 'SOL', 'ICP', 'DOGE', 'USDT',
+    'XRP', 'ADA', 'DOT', 'LINK', 'BCH', 'ATOM', 'UNI', 'NEAR',
+    'XLM', 'MATIC', 'FIL', 'APT',
+]
 
 BUY_THRESHOLD = 0.02        # 2% expected gain
 STRONG_BUY_THRESHOLD = 0.05 # 5% for strong buy
