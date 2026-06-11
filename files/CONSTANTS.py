@@ -23,6 +23,50 @@ MODEL = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
 PATH = f'../newspapers/BTC_newspapers.csv'
 SLEEP = 3
 FILL = -99999999.0
+
+# =============================================================================
+# Phase 2 — News-ingestion agent: credibility gate, query budget, rate limits
+# =============================================================================
+# Primary credibility gate for the news agent. An article is accepted only if
+# its SerpAPI `source.name` matches CREDIBLE_SOURCES (case-insensitive) OR its
+# link domain matches CREDIBLE_DOMAINS. Seeded from outlet names already present
+# in the existing newspapers/*.csv corpus (curated to reputable crypto/finance
+# desks; promotional exchange blogs and price-aggregator pages were excluded).
+CREDIBLE_SOURCES = [
+    # Crypto-native news desks
+    'CoinDesk', 'Cointelegraph', 'Decrypt', 'The Block', 'Brave New Coin',
+    'CryptoSlate', 'crypto.news', 'Cryptonews', 'Cryptonews.net', 'BeInCrypto',
+    'CoinGape', 'Coinspeaker', 'CryptoPotato', 'AMBCrypto', 'DailyCoin',
+    'Cryptopolitan', 'U.Today', 'CCN.com', '99Bitcoins', 'Bitcoin.com News',
+    'Bitcoin Magazine', 'DL News', 'dlnews.com', 'Blockworks', 'Coinpedia',
+    'The Defiant', 'CoinCodex', 'BanklessTimes', 'Coinfomania', 'blockchain.news',
+    # Mainstream finance / general press
+    'Reuters', 'Bloomberg', 'Bloomberg.com', 'CNBC', 'Forbes', 'BBC',
+    'Al Jazeera', 'Financial Times', 'The Wall Street Journal', 'Yahoo Finance',
+    'Investopedia', 'The Economic Times', 'Investing.com', 'FXStreet',
+    'Invezz', 'Capital.com', 'InvestorPlace', 'thestreet.com',
+    'markets.businessinsider.com', 'Business Insider',
+]
+# Secondary gate: accept if the article's link domain matches any of these,
+# even when source.name is missing/odd. Matched as a regex against the host.
+CREDIBLE_DOMAINS = [
+    r'coindesk\.com', r'cointelegraph\.com', r'decrypt\.co', r'theblock\.co',
+    r'bravenewcoin\.com', r'cryptoslate\.com', r'crypto\.news', r'cryptonews\.com',
+    r'beincrypto\.com', r'coingape\.com', r'coinspeaker\.com', r'cryptopotato\.com',
+    r'ambcrypto\.com', r'dailycoin\.com', r'cryptopolitan\.com', r'u\.today',
+    r'ccn\.com', r'99bitcoins\.com', r'news\.bitcoin\.com', r'bitcoinmagazine\.com',
+    r'dlnews\.com', r'blockworks\.co', r'coinpedia\.org', r'thedefiant\.io',
+    r'reuters\.com', r'bloomberg\.com', r'cnbc\.com', r'forbes\.com', r'bbc\.com',
+    r'aljazeera\.com', r'ft\.com', r'wsj\.com', r'finance\.yahoo\.com',
+    r'investopedia\.com', r'economictimes\.indiatimes\.com', r'investing\.com',
+    r'fxstreet\.com', r'invezz\.com', r'capital\.com', r'investorplace\.com',
+    r'thestreet\.com', r'businessinsider\.com',
+]
+# Per-coin, per-run article ingestion budget (after dedup + credibility filter).
+MAX_ARTICLES_PER_COIN = 50
+# Soft guard on total SerpAPI calls in a single agent run, to protect the key's
+# daily quota. The agent stops issuing new searches once this is reached.
+SERPAPI_DAILY_LIMIT = 250
 TEST_DAYS = 7 # do not change
 COINS = [
     'BTC', 'AVAX', 'ETH', 'LTC', 'SOL', 'ICP', 'DOGE', 'USDT',
